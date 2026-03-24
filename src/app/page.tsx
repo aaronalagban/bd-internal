@@ -271,7 +271,7 @@ export default function FlatDashboard() {
               </select>
             </div>
             <h1 className="text-4xl md:text-5xl font-extrabold text-slate-900 tracking-tight pb-1">
-              Marine Deliverables
+              BD Team Deliverables
             </h1>
             <p className="text-lg md:text-xl text-slate-500 mt-2 flex items-center gap-2 font-medium">
               <CalendarDays className="w-5 h-5 text-indigo-500" /> 
