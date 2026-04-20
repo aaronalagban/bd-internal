@@ -40,7 +40,7 @@ const TEAM_MEMBERS = ["Bien", "Aaron", "Michelle"];
 const TEAM_EMAILS: Record<string, string> = {
   Bien: "josiahsantiago22@gmail.com",
   Aaron: "aaronalagban@gmail.com",
-  Michelle: "michelle@bdteam.com",
+  Michelle: "iammichmartinez@gmail.com",
 };
 
 const PIC_COLORS: Record<string, { bg: string; border: string; text: string; bar: string }> = {
