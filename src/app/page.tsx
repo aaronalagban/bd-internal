@@ -38,7 +38,7 @@ const TASK_STATES = ["To Do", "Ongoing", "For Review", "Deferred", "Done"];
 const TEAM_MEMBERS = ["Bien", "Aaron", "Michelle"];
 
 const TEAM_EMAILS: Record<string, string> = {
-  Bien: "bien@bdteam.com",
+  Bien: "josiahsantiago22@gmail.com",
   Aaron: "aaronalagban@gmail.com",
   Michelle: "michelle@bdteam.com",
 };
