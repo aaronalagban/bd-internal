@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { createClient } from "@supabase/supabase-js";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -8,12 +8,12 @@ import {
   Users, User, LayoutDashboard, Calendar as CalendarIcon,
   Moon, Sun, ArrowLeft, ArrowRight, Activity, LogOut, Maximize2,
   GripHorizontal, Circle, Clock, ChevronRight, ChevronLeft,
-  Timer, Eye
+  Timer, Eye, Play, Square
 } from "lucide-react";
 import {
   startOfMonth, endOfMonth, eachDayOfInterval, format, isBefore,
   parseISO, getDay, isWeekend, isSameDay, startOfWeek, endOfWeek,
-  addDays, subDays, addWeeks, subWeeks
+  addDays, subDays, addWeeks, subWeeks, getMonth
 } from "date-fns";
 
 // ─── SUPABASE ────────────────────────────────────────────────────────────────
@@ -33,9 +33,15 @@ type Task = {
   urgency?: "Urgent" | "Routine" | "Scheduled";
   is_colleague_request?: boolean;
   links?: string;
-  time_block_date?: string | null;
-  time_block_start?: string | null; // "HH:MM"
-  time_block_end?: string | null;   // "HH:MM"
+};
+
+// A single time block entry (multiple per task allowed)
+type TimeBlock = {
+  id: string; // local uuid
+  taskId: string;
+  date: string;
+  start: string; // "HH:MM"
+  end: string;   // "HH:MM"
 };
 
 type ViewMode = "dashboard" | "calendar" | "timeblock";
@@ -73,10 +79,10 @@ const STATUS_COLORS: Record<string, { bg: string; border: string; text: string }
 };
 
 // Time block helpers
-const DAY_START_HOUR = 7;   // 7 AM
-const DAY_END_HOUR = 18;    // 6 PM (6:30 is last half slot)
+const DAY_START_HOUR = 7;
+const DAY_END_HOUR = 18;
 const SLOT_MINUTES = 30;
-const TOTAL_SLOTS = ((DAY_END_HOUR - DAY_START_HOUR) * 60) / SLOT_MINUTES + 1; // 7:00–18:30
+const TOTAL_SLOTS = ((DAY_END_HOUR - DAY_START_HOUR) * 60) / SLOT_MINUTES + 1;
 
 function slotLabel(slotIdx: number): string {
   const totalMinutes = DAY_START_HOUR * 60 + slotIdx * SLOT_MINUTES;
@@ -88,6 +94,7 @@ function slotLabel(slotIdx: number): string {
 }
 
 function timeToSlot(time: string): number {
+  if (!time) return 0;
   const [h, m] = time.split(":").map(Number);
   return ((h - DAY_START_HOUR) * 60 + m) / SLOT_MINUTES;
 }
@@ -109,7 +116,11 @@ const isOverdue = (task: Task): boolean => {
   return isBefore(parseISO(ref), new Date()) && !isSameDay(parseISO(ref), new Date());
 };
 
-// ─── REAL-TIME INPUT (debounced for text areas) ───────────────────────────────
+function generateId(): string {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+// ─── REAL-TIME INPUT ──────────────────────────────────────────────────────────
 const RealTimeInput = ({
   value, onSave, className, placeholder,
 }: {
@@ -129,7 +140,6 @@ const RealTimeInput = ({
   );
 };
 
-// Notes textarea that only saves on blur (not on every keystroke)
 const NotesTextarea = ({
   value, onSave, className, placeholder,
 }: {
@@ -163,12 +173,18 @@ export default function BDApp() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [isDarkMode, setIsDarkMode] = useState(true);
 
+  // ── LOCAL time blocks (stored client-side, multi-block per task) ──
+  const [timeBlocks, setTimeBlocks] = useState<Record<string, TimeBlock[]>>({});
+
+  // ── "Currently Working On" toggle: per-member active task id ──
+  const [workingOnTask, setWorkingOnTask] = useState<Record<string, string | null>>({
+    Bien: null, Aaron: null, Michelle: null,
+  });
+
   // ── navigation ──
   const [activeTab, setActiveTab] = useState<ViewMode>("dashboard");
   const [userScope, setUserScope] = useState<UserScope>("member");
-
-  // ── week navigation ──
-  const [weekOffset, setWeekOffset] = useState(0); // 0 = current week
+  const [weekOffset, setWeekOffset] = useState(0);
 
   // ── calendar ──
   const [currentMonth, setCurrentMonth] = useState(new Date().getMonth() + 1);
@@ -178,7 +194,13 @@ export default function BDApp() {
   // ── time block ──
   const [timeBlockDate, setTimeBlockDate] = useState<string>(format(new Date(), "yyyy-MM-dd"));
   const [timeBlockScope, setTimeBlockScope] = useState<UserScope>("member");
-  const [focusedMember, setFocusedMember] = useState<string | null>(null); // "working on" overlay
+  const [tbFilter, setTbFilter] = useState<"This Week" | "Urgent" | "Routine" | "All">("This Week");
+
+  // Drag state for time block sidebar
+  const [draggingTBTaskId, setDraggingTBTaskId] = useState<string | null>(null);
+  const [resizingTB, setResizingTB] = useState<{ id: string; type: "top" | "bottom" } | null>(null);
+  const [tbDragOverSlot, setTbDragOverSlot] = useState<{ member: string; slot: number } | null>(null);
+  const tbGridRef = useRef<HTMLDivElement>(null);
 
   // ── modals ──
   const [showForReview, setShowForReview] = useState(false);
@@ -186,12 +208,7 @@ export default function BDApp() {
   const [showQuickAdd, setShowQuickAdd] = useState(false);
   const [deferTask, setDeferTask] = useState<Task | null>(null);
   const [deferDate, setDeferDate] = useState("");
-
-  // ── time block add modal ──
-  const [showTimeBlockAdd, setShowTimeBlockAdd] = useState(false);
-  const [timeBlockForm, setTimeBlockForm] = useState<{
-    taskId: string; date: string; start: string; end: string;
-  }>({ taskId: "", date: format(new Date(), "yyyy-MM-dd"), start: "09:00", end: "10:00" });
+  const [focusedMember, setFocusedMember] = useState<string | null>(null);
 
   // ── quick-add form ──
   const [newTask, setNewTask] = useState<Partial<Task>>({
@@ -199,7 +216,7 @@ export default function BDApp() {
     start_date: "", end_date: "", pic: "",
   });
 
-  // ── mobile view ──
+  // ── mobile ──
   const [isMobile, setIsMobile] = useState(false);
 
   useEffect(() => {
@@ -209,12 +226,10 @@ export default function BDApp() {
     return () => window.removeEventListener("resize", check);
   }, []);
 
-  // dark mode
   useEffect(() => {
     document.documentElement.classList.toggle("dark", isDarkMode);
   }, [isDarkMode]);
 
-  // session
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (session?.user?.email) {
@@ -224,10 +239,12 @@ export default function BDApp() {
     });
   }, []);
 
-  // realtime
   useEffect(() => {
     if (!loggedInUser) return;
+    
     fetchTasks();
+    fetchTimeBlocks(); // Fetch persistent time blocks
+    
     setNewTask(p => ({ ...p, pic: loggedInUser }));
 
     const ch = supabase
@@ -243,7 +260,17 @@ export default function BDApp() {
       })
       .subscribe();
 
-    return () => { supabase.removeChannel(ch); };
+    const tbCh = supabase
+      .channel("rt-time-blocks")
+      .on("postgres_changes", { event: "*", schema: "public", table: "time_blocks" }, () => {
+        fetchTimeBlocks(); // Refresh when teammates add/move blocks
+      })
+      .subscribe();
+
+    return () => { 
+      supabase.removeChannel(ch); 
+      supabase.removeChannel(tbCh); 
+    };
   }, [loggedInUser]);
 
   // ─── AUTH ──────────────────────────────────────────────────────────────────
@@ -265,6 +292,24 @@ export default function BDApp() {
   const fetchTasks = async () => {
     const { data } = await supabase.from("tasks").select("*");
     if (data) setTasks(data);
+  };
+
+  const fetchTimeBlocks = async () => {
+    const { data, error } = await supabase.from("time_blocks").select("*");
+    if (data && !error) {
+      const blocks: Record<string, TimeBlock[]> = {};
+      data.forEach(row => {
+        if (!blocks[row.member]) blocks[row.member] = [];
+        blocks[row.member].push({
+          id: row.id,
+          taskId: row.task_id,
+          date: row.date,
+          start: row.start_time,
+          end: row.end_time,
+        });
+      });
+      setTimeBlocks(blocks);
+    }
   };
 
   const addTask = async (e: React.FormEvent) => {
@@ -298,14 +343,87 @@ export default function BDApp() {
     setDeferDate("");
   };
 
-  const addTimeBlock = async () => {
-    if (!timeBlockForm.taskId || !timeBlockForm.date) return;
-    await updateTask(timeBlockForm.taskId, {
-      time_block_date: timeBlockForm.date,
-      time_block_start: timeBlockForm.start,
-      time_block_end: timeBlockForm.end,
-    });
-    setShowTimeBlockAdd(false);
+  // ─── WORKING ON TOGGLE ─────────────────────────────────────────────────────
+  // Steam-style: toggle a task as "currently working on" for a member
+  const toggleWorkingOn = (member: string, taskId: string) => {
+    setWorkingOnTask(prev => ({
+      ...prev,
+      [member]: prev[member] === taskId ? null : taskId,
+    }));
+  };
+
+  // ─── TIME BLOCKS (Synced with DB) ──────────────────────────────────────────
+  const addTimeBlockEntry = async (member: string, taskId: string, date: string, startSlot: number, endSlot: number) => {
+    const blockId = generateId();
+    const start = slotToTime(startSlot);
+    const end = slotToTime(Math.min(endSlot, TOTAL_SLOTS - 1));
+
+    const block: TimeBlock = { id: blockId, taskId, date, start, end };
+
+    // 1. Optimistic UI Update (immediate visual feedback)
+    setTimeBlocks(prev => ({
+      ...prev,
+      [member]: [...(prev[member] || []), block],
+    }));
+
+    // 2. Save to database
+    const { error } = await supabase.from("time_blocks").insert([{
+      id: blockId,
+      task_id: taskId,
+      member: member,
+      date: date,
+      start_time: start,
+      end_time: end
+    }]);
+
+    if (error) {
+      console.error("Supabase TimeBlock Error:", error);
+      alert(`Could not save block: ${error.message}`);
+      setTimeBlocks(prev => ({
+        ...prev,
+        [member]: (prev[member] || []).filter(b => b.id !== blockId),
+      }));
+    }
+  };
+
+  const updateTimeBlockBounds = async (member: string, blockId: string, newStartSlot: number, newEndSlot: number, oldBlock: TimeBlock) => {
+    const start = slotToTime(newStartSlot);
+    const end = slotToTime(Math.min(newEndSlot, TOTAL_SLOTS - 1));
+
+    // Optimistic UI update
+    setTimeBlocks(prev => ({
+      ...prev,
+      [member]: (prev[member] || []).map(b => b.id === blockId ? { ...b, start, end } : b)
+    }));
+
+    // Update Database
+    const { error } = await supabase.from("time_blocks").update({
+      start_time: start,
+      end_time: end
+    }).eq("id", blockId);
+
+    if (error) {
+      console.error("Supabase Resize Error:", error);
+      alert(`Could not resize block: ${error.message}`);
+      // Revert if failed
+      setTimeBlocks(prev => ({
+        ...prev,
+        [member]: (prev[member] || []).map(b => b.id === blockId ? oldBlock : b)
+      }));
+    }
+  };
+
+  const removeTimeBlock = async (member: string, blockId: string) => {
+    setTimeBlocks(prev => ({
+      ...prev,
+      [member]: (prev[member] || []).filter(b => b.id !== blockId),
+    }));
+
+    const { error } = await supabase.from("time_blocks").delete().eq("id", blockId);
+    if (error) {
+      console.error("Delete Error:", error);
+      alert(`Could not delete block: ${error.message}`);
+    }
   };
 
   // ─── DERIVED ───────────────────────────────────────────────────────────────
@@ -341,13 +459,6 @@ export default function BDApp() {
   }));
 
   const isCurrentWeek = weekOffset === 0;
-
-  // ─── "WORKING ON" overlay ──────────────────────────────────────────────────
-  const memberCurrentTask = focusedMember
-    ? tasks.find(t => t.pic === focusedMember && t.status === "Ongoing") ||
-      tasks.find(t => t.pic === focusedMember && t.status === "To Do" && inWeek(t)) ||
-      null
-    : null;
 
   // ═══════════════════════════════════════════════════════════════════════════
   //  LOGIN SCREEN
@@ -399,7 +510,6 @@ export default function BDApp() {
     );
   }
 
-  // ─── MOBILE VIEW ──────────────────────────────────────────────────────────
   if (isMobile) {
     return renderMobileView();
   }
@@ -413,6 +523,7 @@ export default function BDApp() {
     const isDeferred = task.status === "Deferred";
     const uColor  = URGENCY_COLORS[task.urgency || "Routine"];
     const ref     = task.end_date || task.start_date;
+    const isWorking = loggedInUser ? workingOnTask[loggedInUser] === task.id : false;
 
     return (
       <motion.div
@@ -422,13 +533,14 @@ export default function BDApp() {
         exit={{ opacity: 0 }}
         onClick={() => setEnrichTask(task)}
         className={`group flex items-center gap-3 px-4 py-3 rounded-2xl border cursor-pointer transition-all
-          ${isDone
-            ? "opacity-50 bg-[#FBFBFD] dark:bg-[#1A1A1D] border-[#04154D]/5 dark:border-white/5"
-            : isDeferred
-              ? "opacity-60 bg-slate-500/5 dark:bg-slate-500/10 border-slate-500/10"
-              : overdue
-                ? "bg-red-500/5 dark:bg-red-500/10 border-red-500/20 hover:border-red-500/40"
-                : "bg-white dark:bg-[#1A1A1D] border-[#04154D]/8 dark:border-white/8 hover:border-[#2A59FF]/30 hover:shadow-sm"
+          ${isWorking ? "ring-2 ring-[#2A59FF]/40 bg-[#2A59FF]/5 border-[#2A59FF]/30" :
+            isDone
+              ? "opacity-50 bg-[#FBFBFD] dark:bg-[#1A1A1D] border-[#04154D]/5 dark:border-white/5"
+              : isDeferred
+                ? "opacity-60 bg-slate-500/5 dark:bg-slate-500/10 border-slate-500/10"
+                : overdue
+                  ? "bg-red-500/5 dark:bg-red-500/10 border-red-500/20 hover:border-red-500/40"
+                  : "bg-white dark:bg-[#1A1A1D] border-[#04154D]/8 dark:border-white/8 hover:border-[#2A59FF]/30 hover:shadow-sm"
           }`}
       >
         <button
@@ -450,6 +562,24 @@ export default function BDApp() {
         <span className={`flex-1 text-sm font-semibold truncate ${isDone ? "line-through text-[#04154D]/40 dark:text-white/40" : "text-[#04154D] dark:text-white"}`}>
           {task.title}
         </span>
+
+        {/* Working on toggle — Steam style */}
+        {task.pic === loggedInUser && !isDone && !isDeferred && (
+          <button
+            onClick={e => {
+              e.stopPropagation();
+              toggleWorkingOn(loggedInUser!, task.id);
+            }}
+            title={isWorking ? "Stop working on this" : "Mark as currently working on"}
+            className={`shrink-0 flex items-center gap-1 px-2 py-1 rounded-lg text-[9px] font-bold transition-all border
+              ${isWorking
+                ? "bg-[#2A59FF] border-[#2A59FF] text-white shadow-sm"
+                : "border-[#04154D]/10 dark:border-white/10 text-[#04154D]/30 dark:text-white/30 hover:border-[#2A59FF]/40 hover:text-[#2A59FF]"
+              }`}
+          >
+            {isWorking ? <><Square size={8} fill="currentColor" /> Currently Working On</> : <><Play size={8} /> Do</>}
+          </button>
+        )}
 
         <div className="flex items-center gap-2 shrink-0">
           {overdue && !isDone && !isDeferred && (
@@ -475,10 +605,6 @@ export default function BDApp() {
           )}
           <select
             value={task.status}
-            onClick={e => {
-              e.stopPropagation();
-              // If selecting Deferred, open defer modal
-            }}
             onChange={e => {
               e.stopPropagation();
               if (e.target.value === "Deferred") {
@@ -488,6 +614,7 @@ export default function BDApp() {
                 updateTask(task.id, { status: e.target.value });
               }
             }}
+            onClick={e => e.stopPropagation()}
             className={`text-[9px] font-bold px-2 py-1 rounded-lg border outline-none cursor-pointer transition-colors shrink-0
               ${STATUS_COLORS[task.status]?.bg || ""} ${STATUS_COLORS[task.status]?.border || ""} ${STATUS_COLORS[task.status]?.text || ""}`}
           >
@@ -549,7 +676,7 @@ export default function BDApp() {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  //  TEAM LOAD — per person view
+  //  TEAM LOAD
   // ═══════════════════════════════════════════════════════════════════════════
   function TeamLoadSection() {
     const [expandedMember, setExpandedMember] = useState<string | null>(null);
@@ -560,6 +687,8 @@ export default function BDApp() {
           const pct = total === 0 ? 0 : Math.round((done / total) * 100);
           const isHeavy = total >= 6;
           const isExpanded = expandedMember === name;
+          const activeTaskId = workingOnTask[name];
+          const activeTask = activeTaskId ? tasks.find(t => t.id === activeTaskId) : null;
 
           return (
             <div key={name} className="flex flex-col gap-1">
@@ -571,25 +700,27 @@ export default function BDApp() {
                   {name.charAt(0)}
                 </div>
                 <div className="flex-1 min-w-0">
-                  <div className="flex justify-between items-baseline mb-1">
+                  <div className="flex justify-between items-baseline mb-0.5">
                     <span className="text-[11px] font-semibold text-[#04154D] dark:text-white">{name}</span>
-                    <span className={`text-[10px] font-bold ${isHeavy ? "text-[#FF5B24]" : "text-[#04154D]/40 dark:text-white/40"}`}>{done}/{total}</span>
                   </div>
-                  <div className="h-1.5 bg-[#04154D]/8 dark:bg-white/8 rounded-full overflow-hidden">
-                    <div className={`h-full rounded-full transition-all duration-500 ${PIC_COLORS[name].bar}`}
-                      style={{ width: total === 0 ? "0%" : `${pct}%` }} />
-                  </div>
+                  {/* Steam-style "currently playing" */}
+                  {activeTask ? (
+                    <p className={`text-[9px] font-bold truncate ${PIC_COLORS[name].text}`}>
+                      ▶ {activeTask.title}
+                    </p>
+                  ) : (
+                    <p className="text-[9px] text-[#04154D]/25 dark:text-white/25 italic">Idle</p>
+                  )}
                 </div>
                 <ChevronRight size={12} className={`text-[#04154D]/20 dark:text-white/20 transition-transform shrink-0 ${isExpanded ? "rotate-90" : ""}`} />
               </button>
 
-              {/* Quick "working on" button */}
               <button
                 onClick={() => setFocusedMember(name)}
                 className={`ml-10 flex items-center gap-1.5 text-[9px] font-bold px-2 py-1 rounded-lg border transition-all
                   ${PIC_COLORS[name].bg} ${PIC_COLORS[name].border} ${PIC_COLORS[name].text} hover:scale-105`}
               >
-                <Eye size={9} /> Working on…
+                <Eye size={9} /> View status…
               </button>
 
               {isExpanded && memberTasks.length > 0 && (
@@ -619,28 +750,23 @@ export default function BDApp() {
   //  DASHBOARD
   // ═══════════════════════════════════════════════════════════════════════════
   function renderDashboard() {
-    const isCurrentWeekView = weekOffset === 0;
     return (
       <motion.div key="dash" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
         className="absolute inset-0 flex overflow-hidden">
 
-        {/* ── LEFT: TASK COLUMN ── */}
         <div className="flex-1 flex flex-col min-w-0 overflow-hidden border-r border-[#04154D]/5 dark:border-white/5">
-
-          {/* Header */}
           <div className="flex items-center justify-between px-6 md:px-8 pt-5 md:pt-7 pb-4 md:pb-5 shrink-0 flex-wrap gap-3">
             <div>
               <div className="flex items-center gap-3">
                 <h2 className="text-2xl md:text-3xl font-black text-[#04154D] dark:text-white tracking-tight leading-tight">
-                  {isCurrentWeekView ? format(today, "EEEE, MMMM do") : "Past / Future Week"}
+                  {isCurrentWeek ? format(today, "EEEE, MMMM do") : "Past / Future Week"}
                 </h2>
-                {/* Week navigator */}
                 <div className="flex items-center gap-1 bg-white dark:bg-[#1A1A1D] border border-[#04154D]/10 dark:border-white/10 rounded-xl px-2 py-1">
                   <button onClick={() => setWeekOffset(p => p - 1)} className="p-1 rounded-lg hover:bg-[#04154D]/5 dark:hover:bg-white/5 transition-colors text-[#04154D] dark:text-white">
                     <ChevronLeft size={14} />
                   </button>
-                  <button onClick={() => setWeekOffset(0)} className={`text-[9px] font-bold px-2 py-0.5 rounded transition-colors ${isCurrentWeekView ? "text-[#2A59FF]" : "text-[#04154D]/50 dark:text-white/50 hover:text-[#2A59FF]"}`}>
-                    {isCurrentWeekView ? "This Week" : weekOffset < 0 ? `${Math.abs(weekOffset)}w ago` : `+${weekOffset}w`}
+                  <button onClick={() => setWeekOffset(0)} className={`text-[9px] font-bold px-2 py-0.5 rounded transition-colors ${isCurrentWeek ? "text-[#2A59FF]" : "text-[#04154D]/50 dark:text-white/50 hover:text-[#2A59FF]"}`}>
+                    {isCurrentWeek ? "This Week" : weekOffset < 0 ? `${Math.abs(weekOffset)}w ago` : `+${weekOffset}w`}
                   </button>
                   <button onClick={() => setWeekOffset(p => p + 1)} className="p-1 rounded-lg hover:bg-[#04154D]/5 dark:hover:bg-white/5 transition-colors text-[#04154D] dark:text-white">
                     <ChevronRight size={14} />
@@ -663,7 +789,6 @@ export default function BDApp() {
             </div>
           </div>
 
-          {/* Stat strip */}
           <div className="grid grid-cols-4 gap-2 md:gap-3 px-6 md:px-8 pb-4 md:pb-5 shrink-0">
             {[
               { label: "Done", value: `${doneCount}/${weekTasks.length}`, color: "text-[#2A59FF]", bg: "bg-white dark:bg-[#121214]", border: "border-[#04154D]/10 dark:border-white/10" },
@@ -678,7 +803,6 @@ export default function BDApp() {
             ))}
           </div>
 
-          {/* Task list */}
           <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-6 md:px-8 pb-8 space-y-5">
             {urgentTasks.length > 0 && (
               <div>
@@ -747,7 +871,7 @@ export default function BDApp() {
           </div>
         </div>
 
-        {/* ── RIGHT PANEL ── */}
+        {/* RIGHT PANEL */}
         <div className="w-64 lg:w-72 xl:w-80 shrink-0 flex flex-col overflow-hidden bg-[#FBFBFD] dark:bg-[#050505]">
           <div className="p-5 md:p-6 border-b border-[#04154D]/5 dark:border-white/5">
             <div className="flex items-center justify-between mb-4">
@@ -785,19 +909,21 @@ export default function BDApp() {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  //  CALENDAR (Gantt)
+  //  CALENDAR (Gantt) — with cross-month day display, no weekend tasks
   // ═══════════════════════════════════════════════════════════════════════════
   function renderCalendar() {
     const monthStart = startOfMonth(new Date(2026, currentMonth - 1));
     const monthEnd   = endOfMonth(monthStart);
-    const calDays    = eachDayOfInterval({ start: monthStart, end: monthEnd });
+
+    // Expand to full weeks (Sun→Sat), so we catch overflow days from adjacent months
+    const calStart = startOfWeek(monthStart, { weekStartsOn: 0 });
+    const calEnd   = endOfWeek(monthEnd, { weekStartsOn: 0 });
+    const calDays  = eachDayOfInterval({ start: calStart, end: calEnd });
 
     const weeks: Date[][] = [];
-    let wk: Date[] = [];
-    calDays.forEach(d => {
-      wk.push(d);
-      if (getDay(d) === 6 || isSameDay(d, monthEnd)) { weeks.push(wk); wk = []; }
-    });
+    for (let i = 0; i < calDays.length; i += 7) {
+      weeks.push(calDays.slice(i, i + 7));
+    }
 
     const onDragStart = (e: React.DragEvent, taskId: string) => {
       e.dataTransfer.setData("taskId", taskId);
@@ -873,7 +999,7 @@ export default function BDApp() {
           {userScope === "member" && (
             <div className="w-44 md:w-52 flex flex-col bg-[#FBFBFD] dark:bg-[#1A1A1D] rounded-[2rem] border border-[#04154D]/10 dark:border-white/10 p-4 md:p-5 shrink-0 min-h-0">
               <h3 className="text-[10px] font-black uppercase tracking-widest text-[#04154D]/40 dark:text-white/40 mb-1 shrink-0">Drag to Schedule</h3>
-              <p className="text-[9px] text-[#04154D]/25 dark:text-white/25 font-medium mb-4 shrink-0">Drop on any calendar day</p>
+              <p className="text-[9px] text-[#04154D]/25 dark:text-white/25 font-medium mb-4 shrink-0">Drop on any weekday</p>
               <div className="flex-1 overflow-y-auto space-y-2.5 no-scrollbar pb-4">
                 {unscheduled.length === 0
                   ? <p className="text-xs text-center italic opacity-40 mt-10 text-[#04154D] dark:text-white">All scheduled!</p>
@@ -898,8 +1024,11 @@ export default function BDApp() {
           )}
 
           <div className="flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden">
-            <div className="grid grid-cols-7 gap-1 md:gap-1.5 mb-2 text-center font-bold text-[#04154D]/25 dark:text-white/25 text-[9px] uppercase tracking-widest shrink-0">
-              {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(d => <div key={d}>{d}</div>)}
+            {/* Day headers */}
+            <div className="grid grid-cols-7 gap-1 md:gap-1.5 mb-2 shrink-0">
+              {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(d => (
+                <div key={d} className={`text-center font-bold text-[9px] uppercase tracking-widest ${d === "Sat" || d === "Sun" ? "text-[#04154D]/15 dark:text-white/15" : "text-[#04154D]/25 dark:text-white/25"}`}>{d}</div>
+              ))}
             </div>
 
             <div className="flex-1 overflow-y-auto no-scrollbar pb-20 space-y-1.5 min-h-0">
@@ -907,50 +1036,77 @@ export default function BDApp() {
                 const wStart = week[0];
                 const wEnd   = new Date(week[week.length - 1]); wEnd.setHours(23, 59, 59);
 
+                // Only show weekday tasks (Mon–Fri = indices 1–5)
                 const wTasks = visibleTasks.filter(t => {
                   if (!t.start_date || t.status === "Deferred") return false;
-                  return parseISO(t.start_date) <= wEnd && parseISO(t.end_date || t.start_date) >= wStart;
+                  const ts = parseISO(t.start_date);
+                  const te = parseISO(t.end_date || t.start_date);
+                  return ts <= wEnd && te >= wStart;
                 });
 
                 return (
                   <div key={wIdx}
                     className="relative w-full border border-[#04154D]/8 dark:border-white/8 rounded-2xl overflow-visible bg-[#FBFBFD] dark:bg-[#121214]"
-                    style={{ minHeight: `${Math.max(100, wTasks.length * 34 + 36)}px` }}>
+                    style={{ minHeight: `${Math.max(84, wTasks.length * 34 + 36)}px` }}>
 
+                    {/* Day cells */}
                     <div className="absolute inset-0 grid grid-cols-7 rounded-2xl overflow-hidden">
-                      {[0,1,2,3,4,5,6].map(i => {
-                        const day = week.find(d => getDay(d) === i);
-                        const ds  = day ? format(day, "yyyy-MM-dd") : "";
-                        const isDragOver = dragOverDate === ds && ds !== "";
-                        const isToday    = day ? isSameDay(day, today) : false;
+                      {week.map((day, i) => {
+                        const ds  = format(day, "yyyy-MM-dd");
+                        const isDragOver = dragOverDate === ds;
+                        const isToday    = isSameDay(day, today);
+                        const isWeekendDay = isWeekend(day);
+                        const isThisMonth = getMonth(day) === currentMonth - 1;
+                        const isOverflowDay = !isThisMonth;
+
                         return (
                           <div key={i}
-                            onDragOver={day ? e => { e.preventDefault(); setDragOverDate(ds); } : undefined}
-                            onDrop={day ? e => onDrop(e, day) : undefined}
+                            onDragOver={!isWeekendDay ? e => { e.preventDefault(); setDragOverDate(ds); } : undefined}
+                            onDrop={!isWeekendDay ? e => onDrop(e, day) : undefined}
                             onDragLeave={() => setDragOverDate(null)}
                             className={`border-r border-[#04154D]/5 dark:border-white/5 last:border-r-0 p-2 transition-colors duration-75
-                              ${isToday ? "bg-[#2A59FF]/5" : ""}
-                              ${isDragOver ? "bg-[#2A59FF]/10" : ""}
-                              ${day && isWeekend(day) && !isDragOver ? "bg-[#04154D]/[0.012] dark:bg-white/[0.012]" : ""}
+                              ${isWeekendDay ? "bg-[#04154D]/[0.025] dark:bg-white/[0.025]" : ""}
+                              ${isToday && !isWeekendDay ? "bg-[#2A59FF]/5" : ""}
+                              ${isDragOver && !isWeekendDay ? "bg-[#2A59FF]/10" : ""}
                             `}>
-                            {day && (
-                              <span className={`text-[9px] font-bold ${isToday ? "text-[#2A59FF]" : "text-[#04154D]/20 dark:text-white/20"}`}>
+                            <div className="flex flex-col items-center">
+                              <span className={`text-[9px] font-bold leading-none
+                                ${isToday ? "text-[#2A59FF]" : isOverflowDay ? "text-[#04154D]/15 dark:text-white/15" : isWeekendDay ? "text-[#04154D]/15 dark:text-white/15" : "text-[#04154D]/20 dark:text-white/20"}`}>
                                 {format(day, "d")}
                               </span>
-                            )}
+                              {/* Show month label for overflow days */}
+                              {isOverflowDay && (
+                                <span className="text-[7px] font-bold text-[#04154D]/10 dark:text-white/10 uppercase tracking-wider leading-none mt-0.5">
+                                  {format(day, "MMM")}
+                                </span>
+                              )}
+                            </div>
                           </div>
                         );
                       })}
                     </div>
 
+                    {/* Task bars — only Mon–Fri (col indices 1–5) */}
                     <div className="absolute top-7 left-0 right-0 bottom-0 px-1 pointer-events-none">
                       {wTasks.map((task, idx) => {
                         const ts     = parseISO(task.start_date!);
                         const te     = parseISO(task.end_date || task.start_date!);
-                        const eStart = ts < wStart ? wStart : ts;
-                        const eEnd   = te > wEnd   ? wEnd   : te;
-                        const startI = getDay(eStart);
-                        const span   = Math.round((eEnd.getTime() - eStart.getTime()) / 86400000) + 1;
+
+                        // Clamp to Mon–Fri within this week
+                        // Get Mon (col 1) and Fri (col 5) of this week
+                        const monday = week[1]; // week is Sun-indexed so week[1]=Mon
+                        const friday = week[5]; // week[5]=Fri
+
+                        // Clamp task span to Mon–Fri
+                        const eStart = ts < monday ? monday : ts > friday ? null : ts;
+                        const eEnd   = te > friday ? friday : te < monday ? null : te;
+                        if (!eStart || !eEnd) return null;
+
+                        // Column index within the 7-col grid (0=Sun,1=Mon,...,6=Sat)
+                        const startDow = getDay(eStart); // 1=Mon...5=Fri
+                        const endDow   = getDay(eEnd);
+                        const span     = endDow - startDow + 1;
+
                         const colors = userScope === "team" ? PIC_COLORS[task.pic] || PIC_COLORS["Bien"] : URGENCY_COLORS[task.urgency || "Routine"];
                         const overdue = isOverdue(task);
 
@@ -965,7 +1121,11 @@ export default function BDApp() {
                               ${overdue ? "bg-red-500/15 border-red-500/30 text-red-700 dark:text-red-400" : `${colors?.bg || ""} ${colors?.border || ""} ${colors?.text || ""}`}
                               ${draggingTaskId === task.id ? "opacity-40" : ""}
                             `}
-                            style={{ left: `calc(${(startI / 7) * 100}% + 2px)`, width: `calc(${(span / 7) * 100}% - 4px)`, top: `${idx * 34}px` }}>
+                            style={{
+                              left: `calc(${(startDow / 7) * 100}% + 2px)`,
+                              width: `calc(${(span / 7) * 100}% - 4px)`,
+                              top: `${idx * 34}px`
+                            }}>
 
                             <button onClick={e => handleExtend(task.id, "left", task.start_date!, task.end_date || task.start_date!, e)}
                               className="absolute -left-3 hidden group-hover:flex items-center justify-center w-5 h-5 bg-white dark:bg-[#1A1A1D] border border-[#04154D]/15 dark:border-white/15 rounded-full shadow-md z-20 hover:scale-125 transition-transform text-[#04154D] dark:text-white cursor-pointer">
@@ -997,147 +1157,304 @@ export default function BDApp() {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  //  TIME BLOCK VIEW
+  //  TIME BLOCK VIEW — with draggable sidebar, multi-block support, resizable
   // ═══════════════════════════════════════════════════════════════════════════
   function renderTimeBlock() {
     const slots = Array.from({ length: TOTAL_SLOTS }, (_, i) => i);
-    const selectedDateTasks = tasks.filter(t =>
-      t.time_block_date === timeBlockDate &&
-      (timeBlockScope === "team" || t.pic === loggedInUser)
+    const CELL_HEIGHT = 48;
+
+    const members = timeBlockScope === "team" ? TEAM_MEMBERS : [loggedInUser as string];
+
+    // Filter tasks based on tabs and scope
+    let sidebarTasks = tasks.filter(t =>
+      t.status !== "Done" && t.status !== "Deferred" &&
+      (timeBlockScope === "member" ? t.pic === loggedInUser : true)
     );
 
-    const CELL_HEIGHT = 48; // px per 30min slot
+    if (tbFilter === "This Week") {
+      sidebarTasks = sidebarTasks.filter(inWeek);
+    } else if (tbFilter === "Urgent") {
+      sidebarTasks = sidebarTasks.filter(t => t.urgency === "Urgent");
+    } else if (tbFilter === "Routine") {
+      sidebarTasks = sidebarTasks.filter(t => t.urgency === "Routine" || t.urgency === "Scheduled");
+    } // "All" applies no additional filtering
 
-    // For team view, column per member
-    const members = timeBlockScope === "team" ? TEAM_MEMBERS : [loggedInUser as string];
+    // Get all time blocks for the selected date
+    const blocksForDate = (member: string): TimeBlock[] =>
+      (timeBlocks[member] || []).filter(b => b.date === timeBlockDate);
+
+    // Handle dropping an item (new task OR resizing existing) onto the timeline grid
+    const handleTimelineDrop = async (e: React.DragEvent, member: string, slotIdx: number) => {
+      e.preventDefault();
+
+      // Check if we are RESIZING an existing block
+      if (resizingTB) {
+        const block = (timeBlocks[member] || []).find(b => b.id === resizingTB.id);
+        if (block) {
+          let sSlot = timeToSlot(block.start);
+          let eSlot = timeToSlot(block.end);
+
+          if (resizingTB.type === "top") {
+            // New start must not overlap end. If drag too low, clamp to 1 slot.
+            sSlot = Math.min(slotIdx, eSlot - 1);
+          } else {
+            // New end must not overlap start. If drag too high, clamp to 1 slot.
+            // (Snaps to bottom of dropped slot, so +1)
+            eSlot = Math.max(slotIdx + 1, sSlot + 1);
+          }
+
+          if (sSlot < eSlot) {
+            await updateTimeBlockBounds(member, block.id, sSlot, eSlot, block);
+          }
+        }
+        setResizingTB(null);
+        setTbDragOverSlot(null);
+        return;
+      }
+
+      // Check if we are PLACING a new task block
+      const taskId = e.dataTransfer.getData("tbTaskId");
+      if (taskId) {
+        // Default: 1 hour block (2 slots)
+        await addTimeBlockEntry(member, taskId, timeBlockDate, slotIdx, slotIdx + 2);
+        setTbDragOverSlot(null);
+      }
+    };
 
     return (
       <motion.div key="tb" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-        className="absolute inset-0 flex flex-col overflow-hidden">
+        className="absolute inset-0 flex overflow-hidden">
 
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 md:px-8 pt-5 pb-4 shrink-0 flex-wrap gap-3 border-b border-[#04154D]/5 dark:border-white/5">
-          <div>
-            <h2 className="text-2xl font-black text-[#04154D] dark:text-white">Time Blocks</h2>
-            <p className="text-[#2A59FF] font-bold uppercase tracking-widest text-xs mt-0.5">Daily Schedule — 7:00 AM to 6:30 PM</p>
-          </div>
-          <div className="flex items-center gap-3 flex-wrap">
-            <div className="flex bg-[#FBFBFD] dark:bg-[#1A1A1D] p-1 rounded-xl border border-[#04154D]/10 dark:border-white/10">
-              <button onClick={() => setTimeBlockScope("member")}
-                className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${timeBlockScope === "member" ? "bg-[#2A59FF] text-white shadow" : "text-[#04154D]/50 dark:text-white/50"}`}>
-                <User size={13} /> Mine
-              </button>
-              <button onClick={() => setTimeBlockScope("team")}
-                className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${timeBlockScope === "team" ? "bg-[#04154D] dark:bg-white text-white dark:text-[#0A0A0C] shadow" : "text-[#04154D]/50 dark:text-white/50"}`}>
-                <Users size={13} /> Team
-              </button>
-            </div>
-            <input type="date" value={timeBlockDate} onChange={e => setTimeBlockDate(e.target.value)}
-              className="bg-white dark:bg-[#1A1A1D] border border-[#04154D]/10 dark:border-white/10 rounded-xl px-3 py-2 text-sm font-bold text-[#04154D] dark:text-white outline-none" />
-            <button onClick={() => {
-              setTimeBlockForm({ taskId: "", date: timeBlockDate, start: "09:00", end: "10:00" });
-              setShowTimeBlockAdd(true);
-            }}
-              className="bg-[#04154D] dark:bg-[#2A59FF] text-white font-bold text-xs px-4 py-2.5 rounded-xl hover:scale-105 transition-transform flex items-center gap-2">
-              <Timer size={14} /> Add Block
-            </button>
-          </div>
-        </div>
-
-        {/* Grid */}
-        <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar">
-          <div className="flex min-h-full">
-
-            {/* Time labels column */}
-            <div className="w-16 shrink-0 border-r border-[#04154D]/5 dark:border-white/5 sticky left-0 bg-[#FBFBFD] dark:bg-[#0A0A0C] z-10">
-              <div className="h-10" /> {/* header spacer */}
-              {slots.map(i => (
-                <div key={i} style={{ height: CELL_HEIGHT }}
-                  className="flex items-start justify-end pr-3 pt-1.5 border-b border-[#04154D]/5 dark:border-white/5">
-                  {i % 2 === 0 && (
-                    <span className="text-[9px] font-bold text-[#04154D]/30 dark:text-white/30 whitespace-nowrap">{slotLabel(i)}</span>
-                  )}
-                </div>
+        {/* ── LEFT: TASK SIDEBAR (draggable source) ── */}
+        <div className="w-64 shrink-0 flex flex-col border-r border-[#04154D]/5 dark:border-white/5 bg-[#FBFBFD] dark:bg-[#050505]">
+          <div className="px-4 pt-5 pb-3 border-b border-[#04154D]/5 dark:border-white/5 shrink-0">
+            <h3 className="text-[10px] font-black uppercase tracking-widest text-[#04154D]/40 dark:text-white/40 mb-0.5">Tasks</h3>
+            <p className="text-[8px] text-[#04154D]/25 dark:text-white/25 font-medium mb-3">Drag to timeline. Drag block edges to resize.</p>
+            
+            {/* Filter Tabs */}
+            <div className="flex gap-1 overflow-x-auto no-scrollbar pb-1">
+              {(["This Week", "Urgent", "Routine", "All"] as const).map(tab => (
+                <button
+                  key={tab}
+                  onClick={() => setTbFilter(tab)}
+                  className={`shrink-0 px-2.5 py-1 rounded-lg text-[9px] font-bold transition-all border
+                    ${tbFilter === tab 
+                      ? "bg-[#2A59FF] text-white border-transparent shadow-sm" 
+                      : "bg-white dark:bg-[#1A1A1D] border-[#04154D]/10 dark:border-white/10 text-[#04154D]/50 dark:text-white/50 hover:border-[#2A59FF]/40 hover:text-[#2A59FF]"}`}
+                >
+                  {tab}
+                </button>
               ))}
             </div>
+          </div>
 
-            {/* Member columns */}
-            {members.map(member => {
-              const memberTasks = selectedDateTasks.filter(t => t.pic === member && t.time_block_start && t.time_block_end);
+          <div className="flex-1 overflow-y-auto no-scrollbar px-3 py-3 space-y-2">
+            {sidebarTasks.length === 0 ? (
+              <p className="text-[10px] italic text-[#04154D]/20 dark:text-white/20 text-center mt-8">No tasks in this view</p>
+            ) : sidebarTasks.map(t => {
+              const colors = PIC_COLORS[t.pic] || PIC_COLORS["Bien"];
+              const uColors = URGENCY_COLORS[t.urgency || "Routine"];
               return (
-                <div key={member} className="flex-1 min-w-0 relative border-r border-[#04154D]/5 dark:border-white/5 last:border-r-0">
-                  {/* Member header */}
-                  <div className={`h-10 flex items-center justify-center border-b border-[#04154D]/5 dark:border-white/5 sticky top-0 z-10 ${PIC_COLORS[member]?.bg || "bg-white dark:bg-[#121214]"}`}>
-                    <span className={`text-[10px] font-black uppercase tracking-widest ${PIC_COLORS[member]?.text || ""}`}>{member}</span>
+                <div
+                  key={t.id}
+                  draggable
+                  onDragStart={e => {
+                    e.dataTransfer.setData("tbTaskId", t.id);
+                    setDraggingTBTaskId(t.id);
+                  }}
+                  onDragEnd={() => setDraggingTBTaskId(null)}
+                  className={`px-3 py-2.5 rounded-xl border cursor-grab active:cursor-grabbing select-none transition-all hover:scale-[1.02] hover:shadow-sm
+                    ${draggingTBTaskId === t.id ? "opacity-40" : ""}
+                    ${timeBlockScope === "team" ? `${colors.bg} ${colors.border}` : `${uColors.bg} ${uColors.border}`}
+                  `}
+                >
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <GripHorizontal size={9} className="opacity-30 shrink-0" />
+                    {timeBlockScope === "team" && (
+                      <span className={`text-[8px] font-black ${colors.text}`}>{t.pic}</span>
+                    )}
+                    <span className={`text-[8px] font-bold ${timeBlockScope === "team" ? colors.text : uColors.text} ml-auto`}>{t.urgency || "Routine"}</span>
                   </div>
-
-                  {/* Slot rows */}
-                  <div className="relative">
-                    {slots.map(i => {
-                      const nowHour = today.getHours();
-                      const nowMin  = today.getMinutes();
-                      const slotStartMin = DAY_START_HOUR * 60 + i * SLOT_MINUTES;
-                      const nowTotalMin  = nowHour * 60 + nowMin;
-                      const isNowSlot    = Math.abs(slotStartMin - nowTotalMin) < SLOT_MINUTES && isSameDay(parseISO(timeBlockDate), today);
-                      return (
-                        <div key={i} style={{ height: CELL_HEIGHT }}
-                          className={`border-b border-[#04154D]/5 dark:border-white/5
-                            ${i % 2 === 0 ? "" : "bg-[#04154D]/[0.008] dark:bg-white/[0.008]"}
-                            ${isNowSlot ? "bg-[#2A59FF]/5" : ""}
-                          `} />
-                      );
-                    })}
-
-                    {/* Task blocks overlay */}
-                    {memberTasks.map(task => {
-                      const startSlot = timeToSlot(task.time_block_start!);
-                      const endSlot   = timeToSlot(task.time_block_end!);
-                      const slotSpan  = Math.max(1, endSlot - startSlot);
-                      const top       = startSlot * CELL_HEIGHT;
-                      const height    = slotSpan * CELL_HEIGHT - 4;
-                      const colors    = PIC_COLORS[task.pic] || PIC_COLORS["Bien"];
-                      const uColors   = URGENCY_COLORS[task.urgency || "Routine"];
-
-                      return (
-                        <div key={task.id}
-                          onClick={() => setEnrichTask(task)}
-                          className={`absolute left-1 right-1 rounded-xl border cursor-pointer hover:scale-[1.02] transition-all shadow-sm overflow-hidden
-                            ${timeBlockScope === "team" ? `${colors.bg} ${colors.border}` : `${uColors.bg} ${uColors.border}`}`}
-                          style={{ top: `${top}px`, height: `${height}px` }}>
-                          <div className={`w-1 absolute left-0 top-0 bottom-0 ${timeBlockScope === "team" ? colors.bar : (task.urgency === "Urgent" ? "bg-red-500" : task.urgency === "Scheduled" ? "bg-emerald-500" : "bg-slate-400")}`} />
-                          <div className="pl-3 pr-2 pt-1.5 h-full flex flex-col justify-start overflow-hidden">
-                            <p className={`text-[10px] font-black leading-tight truncate ${timeBlockScope === "team" ? colors.text : uColors.text}`}>
-                              {task.title}
-                            </p>
-                            <p className="text-[8px] font-bold text-[#04154D]/30 dark:text-white/30 mt-0.5">
-                              {slotLabel(startSlot)} – {slotLabel(endSlot)}
-                            </p>
-                            {task.status === "Ongoing" && (
-                              <span className="text-[7px] font-black uppercase tracking-widest text-blue-600 dark:text-blue-400 mt-0.5">● Active</span>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-
-                    {/* Current time line */}
-                    {isSameDay(parseISO(timeBlockDate), today) && (() => {
-                      const nowMin = (today.getHours() - DAY_START_HOUR) * 60 + today.getMinutes();
-                      if (nowMin < 0 || nowMin > (DAY_END_HOUR - DAY_START_HOUR) * 60 + SLOT_MINUTES) return null;
-                      const top = (nowMin / SLOT_MINUTES) * CELL_HEIGHT;
-                      return (
-                        <div className="absolute left-0 right-0 z-20 pointer-events-none" style={{ top: `${top}px` }}>
-                          <div className="flex items-center gap-1">
-                            <div className="w-2 h-2 rounded-full bg-[#2A59FF] shrink-0" />
-                            <div className="h-px bg-[#2A59FF] flex-1 opacity-60" />
-                          </div>
-                        </div>
-                      );
-                    })()}
+                  <p className={`text-[10px] font-bold leading-snug ${timeBlockScope === "team" ? colors.text : uColors.text}`}>{t.title}</p>
+                  <div className={`mt-1.5 flex items-center gap-1 text-[7px] font-bold px-1.5 py-0.5 rounded w-fit border
+                    ${STATUS_COLORS[t.status]?.bg} ${STATUS_COLORS[t.status]?.border} ${STATUS_COLORS[t.status]?.text}`}>
+                    {t.status}
                   </div>
                 </div>
               );
             })}
+          </div>
+        </div>
+
+        {/* ── RIGHT: TIMELINE ── */}
+        <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+          {/* Header */}
+          <div className="flex items-center justify-between px-6 pt-5 pb-4 shrink-0 border-b border-[#04154D]/5 dark:border-white/5 flex-wrap gap-3">
+            <div>
+              <h2 className="text-xl font-black text-[#04154D] dark:text-white">Time Blocks</h2>
+              <p className="text-[#2A59FF] font-bold uppercase tracking-widest text-[10px] mt-0.5">7:00 AM – 6:30 PM</p>
+            </div>
+            <div className="flex items-center gap-3 flex-wrap">
+              <div className="flex bg-[#FBFBFD] dark:bg-[#1A1A1D] p-1 rounded-xl border border-[#04154D]/10 dark:border-white/10">
+                <button onClick={() => setTimeBlockScope("member")}
+                  className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${timeBlockScope === "member" ? "bg-[#2A59FF] text-white shadow" : "text-[#04154D]/50 dark:text-white/50"}`}>
+                  <User size={13} /> Mine
+                </button>
+                <button onClick={() => setTimeBlockScope("team")}
+                  className={`px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${timeBlockScope === "team" ? "bg-[#04154D] dark:bg-white text-white dark:text-[#0A0A0C] shadow" : "text-[#04154D]/50 dark:text-white/50"}`}>
+                  <Users size={13} /> Team
+                </button>
+              </div>
+              <input type="date" value={timeBlockDate} onChange={e => setTimeBlockDate(e.target.value)}
+                className="bg-white dark:bg-[#1A1A1D] border border-[#04154D]/10 dark:border-white/10 rounded-xl px-3 py-2 text-sm font-bold text-[#04154D] dark:text-white outline-none" />
+            </div>
+          </div>
+
+          {/* Grid */}
+          <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar" ref={tbGridRef}>
+            <div className="flex min-h-full">
+              {/* Time labels */}
+              <div className="w-14 shrink-0 border-r border-[#04154D]/5 dark:border-white/5 sticky left-0 bg-[#FBFBFD] dark:bg-[#0A0A0C] z-10">
+                <div className="h-10" />
+                {slots.map(i => (
+                  <div key={i} style={{ height: CELL_HEIGHT }}
+                    className="flex items-start justify-end pr-3 pt-1.5 border-b border-[#04154D]/5 dark:border-white/5">
+                    {i % 2 === 0 && (
+                      <span className="text-[8px] font-bold text-[#04154D]/30 dark:text-white/30 whitespace-nowrap">{slotLabel(i)}</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {/* Member columns */}
+              {members.map(member => {
+                const memberBlocks = blocksForDate(member);
+                return (
+                  <div key={member} className="flex-1 min-w-0 relative border-r border-[#04154D]/5 dark:border-white/5 last:border-r-0">
+                    {/* Member header */}
+                    <div className={`h-10 flex items-center justify-center border-b border-[#04154D]/5 dark:border-white/5 sticky top-0 z-10 ${PIC_COLORS[member]?.bg || "bg-white dark:bg-[#121214]"}`}>
+                      <span className={`text-[10px] font-black uppercase tracking-widest ${PIC_COLORS[member]?.text || ""}`}>{member}</span>
+                    </div>
+
+                    {/* Slot rows — drop targets */}
+                    <div className="relative">
+                      {slots.map(i => {
+                        const nowHour = today.getHours();
+                        const nowMin  = today.getMinutes();
+                        const slotStartMin = DAY_START_HOUR * 60 + i * SLOT_MINUTES;
+                        const nowTotalMin  = nowHour * 60 + nowMin;
+                        const isNowSlot = Math.abs(slotStartMin - nowTotalMin) < SLOT_MINUTES && isSameDay(parseISO(timeBlockDate), today);
+                        const isDrop = tbDragOverSlot?.member === member && tbDragOverSlot?.slot === i;
+
+                        return (
+                          <div key={i}
+                            style={{ height: CELL_HEIGHT }}
+                            onDragOver={e => { e.preventDefault(); setTbDragOverSlot({ member, slot: i }); }}
+                            onDrop={e => handleTimelineDrop(e, member, i)}
+                            onDragLeave={() => setTbDragOverSlot(null)}
+                            className={`border-b border-[#04154D]/5 dark:border-white/5 transition-colors
+                              ${i % 2 === 0 ? "" : "bg-[#04154D]/[0.008] dark:bg-white/[0.008]"}
+                              ${isNowSlot ? "bg-[#2A59FF]/5" : ""}
+                              ${isDrop ? "bg-[#2A59FF]/15" : ""}
+                            `}
+                          />
+                        );
+                      })}
+
+                      {/* Render time block entries */}
+                      {memberBlocks.map(block => {
+                        const task = tasks.find(t => t.id === block.taskId);
+                        if (!task) return null;
+                        const startSlot = timeToSlot(block.start);
+                        const endSlot   = timeToSlot(block.end);
+                        const slotSpan  = Math.max(1, endSlot - startSlot);
+                        const top       = startSlot * CELL_HEIGHT;
+                        const height    = slotSpan * CELL_HEIGHT - 4;
+                        const colors    = PIC_COLORS[task.pic] || PIC_COLORS["Bien"];
+                        const uColors   = URGENCY_COLORS[task.urgency || "Routine"];
+
+                        const isResizingThis = resizingTB?.id === block.id;
+
+                        return (
+                          <div key={block.id}
+                            onClick={() => setEnrichTask(task)}
+                            className={`absolute left-1 right-1 rounded-xl border transition-all shadow-sm overflow-hidden group
+                              ${isResizingThis ? "opacity-60 scale-[0.98] z-30" : "hover:scale-[1.02] cursor-pointer"}
+                              ${timeBlockScope === "team" ? `${colors.bg} ${colors.border}` : `${uColors.bg} ${uColors.border}`}
+                            `}
+                            style={{ top: `${top}px`, height: `${height}px`, zIndex: isResizingThis ? 40 : 10 }}>
+                            
+                            {/* Resize Handle (TOP) */}
+                            <div 
+                              draggable
+                              onDragStart={e => {
+                                e.stopPropagation();
+                                e.dataTransfer.setData("text/plain", ""); // req for FF
+                                setResizingTB({ id: block.id, type: "top" });
+                              }}
+                              onDragEnd={() => { setResizingTB(null); setTbDragOverSlot(null); }}
+                              className="absolute top-0 left-0 right-0 h-3 cursor-ns-resize z-20 flex justify-center opacity-0 group-hover:opacity-100 bg-[#04154D]/10 dark:bg-white/10 hover:bg-[#04154D]/20 dark:hover:bg-white/20 transition-opacity"
+                            >
+                              <div className="w-8 h-1 rounded-full bg-[#04154D]/40 dark:bg-white/40 mt-1" />
+                            </div>
+
+                            <div className={`w-1 absolute left-0 top-0 bottom-0 ${timeBlockScope === "team" ? colors.bar : (task.urgency === "Urgent" ? "bg-red-500" : task.urgency === "Scheduled" ? "bg-emerald-500" : "bg-slate-400")}`} />
+                            
+                            <div className="pl-3 pr-2 pt-2.5 pb-2 h-full flex flex-col justify-start overflow-hidden pointer-events-none">
+                              <p className={`text-[10px] font-black leading-tight truncate ${timeBlockScope === "team" ? colors.text : uColors.text}`}>
+                                {task.title}
+                              </p>
+                              <p className="text-[8px] font-bold text-[#04154D]/30 dark:text-white/30 mt-0.5">
+                                {slotLabel(startSlot)} – {slotLabel(endSlot)}
+                              </p>
+                            </div>
+
+                            {/* Remove block button (FIXED to be always accessible) */}
+                            <button
+                              onClick={e => { e.stopPropagation(); removeTimeBlock(member, block.id); }}
+                              title="Remove from timeline"
+                              className="absolute top-1.5 right-1.5 flex items-center justify-center w-5 h-5 bg-white dark:bg-[#121214] rounded-full border border-[#04154D]/10 dark:border-white/10 text-[#04154D]/50 dark:text-white/50 hover:text-red-500 hover:border-red-500/30 shadow-sm transition-all z-30 sm:opacity-0 group-hover:opacity-100 focus-within:opacity-100"
+                            >
+                              <X size={10} />
+                            </button>
+
+                            {/* Resize Handle (BOTTOM) */}
+                            <div 
+                              draggable
+                              onDragStart={e => {
+                                e.stopPropagation();
+                                e.dataTransfer.setData("text/plain", ""); // req for FF
+                                setResizingTB({ id: block.id, type: "bottom" });
+                              }}
+                              onDragEnd={() => { setResizingTB(null); setTbDragOverSlot(null); }}
+                              className="absolute bottom-0 left-0 right-0 h-3 cursor-ns-resize z-20 flex justify-center items-end opacity-0 group-hover:opacity-100 bg-[#04154D]/10 dark:bg-white/10 hover:bg-[#04154D]/20 dark:hover:bg-white/20 transition-opacity"
+                            >
+                              <div className="w-8 h-1 rounded-full bg-[#04154D]/40 dark:bg-white/40 mb-1" />
+                            </div>
+
+                          </div>
+                        );
+                      })}
+
+                      {/* Current time line */}
+                      {isSameDay(parseISO(timeBlockDate), today) && (() => {
+                        const nowMin = (today.getHours() - DAY_START_HOUR) * 60 + today.getMinutes();
+                        if (nowMin < 0 || nowMin > (DAY_END_HOUR - DAY_START_HOUR) * 60 + SLOT_MINUTES) return null;
+                        const top = (nowMin / SLOT_MINUTES) * CELL_HEIGHT;
+                        return (
+                          <div className="absolute left-0 right-0 z-20 pointer-events-none" style={{ top: `${top}px` }}>
+                            <div className="flex items-center gap-1">
+                              <div className="w-2 h-2 rounded-full bg-[#2A59FF] shrink-0" />
+                              <div className="h-px bg-[#2A59FF] flex-1 opacity-60" />
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </div>
       </motion.div>
@@ -1145,92 +1462,18 @@ export default function BDApp() {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  //  TIME BLOCK ADD MODAL
-  // ═══════════════════════════════════════════════════════════════════════════
-  function renderTimeBlockAdd() {
-    const availableTasks = tasks.filter(t =>
-      (timeBlockScope === "member" ? t.pic === loggedInUser : true) &&
-      t.status !== "Done" && t.status !== "Deferred"
-    );
-
-    return (
-      <div className="fixed inset-0 z-[90] flex items-center justify-center p-4">
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-          onClick={() => setShowTimeBlockAdd(false)}
-          className="absolute inset-0 bg-[#04154D]/60 dark:bg-black/80 backdrop-blur-sm cursor-pointer" />
-        <motion.div initial={{ y: 40, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: 40, opacity: 0 }}
-          transition={{ type: "spring", damping: 28, stiffness: 280 }}
-          className="relative w-full max-w-md bg-white dark:bg-[#121214] rounded-[2.5rem] shadow-2xl border border-[#04154D]/10 dark:border-white/10 p-8 z-10 flex flex-col gap-5">
-
-          <div className="flex items-center justify-between">
-            <h3 className="text-lg font-black text-[#04154D] dark:text-white flex items-center gap-2">
-              <Timer size={20} className="text-[#2A59FF]" /> Add Time Block
-            </h3>
-            <button onClick={() => setShowTimeBlockAdd(false)} className="p-2 rounded-full hover:bg-[#04154D]/5 dark:hover:bg-white/5 text-[#04154D]/40 dark:text-white/40">
-              <X size={18} />
-            </button>
-          </div>
-
-          <div>
-            <label className="text-[10px] font-bold uppercase tracking-widest text-[#04154D]/40 dark:text-white/40 block mb-1.5">Select Task</label>
-            <select value={timeBlockForm.taskId} onChange={e => setTimeBlockForm(p => ({ ...p, taskId: e.target.value }))}
-              className="w-full bg-[#FBFBFD] dark:bg-[#1A1A1D] text-[#04154D] dark:text-white border border-[#04154D]/10 dark:border-white/10 rounded-xl px-4 py-3 text-sm font-bold outline-none cursor-pointer">
-              <option value="">— choose a task —</option>
-              {availableTasks.map(t => (
-                <option key={t.id} value={t.id}>{t.title} ({t.pic})</option>
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <label className="text-[10px] font-bold uppercase tracking-widest text-[#04154D]/40 dark:text-white/40 block mb-1.5">Date</label>
-            <input type="date" value={timeBlockForm.date} onChange={e => setTimeBlockForm(p => ({ ...p, date: e.target.value }))}
-              className="w-full bg-[#FBFBFD] dark:bg-[#1A1A1D] text-[#04154D] dark:text-white border border-[#04154D]/10 dark:border-white/10 rounded-xl px-4 py-3 text-sm font-bold outline-none" />
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="text-[10px] font-bold uppercase tracking-widest text-[#04154D]/40 dark:text-white/40 block mb-1.5">Start Time</label>
-              <select value={timeBlockForm.start} onChange={e => setTimeBlockForm(p => ({ ...p, start: e.target.value }))}
-                className="w-full bg-[#FBFBFD] dark:bg-[#1A1A1D] text-[#04154D] dark:text-white border border-[#04154D]/10 dark:border-white/10 rounded-xl px-3 py-3 text-sm font-bold outline-none cursor-pointer">
-                {Array.from({ length: TOTAL_SLOTS }, (_, i) => (
-                  <option key={i} value={slotToTime(i)}>{slotLabel(i)}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="text-[10px] font-bold uppercase tracking-widest text-[#04154D]/40 dark:text-white/40 block mb-1.5">End Time</label>
-              <select value={timeBlockForm.end} onChange={e => setTimeBlockForm(p => ({ ...p, end: e.target.value }))}
-                className="w-full bg-[#FBFBFD] dark:bg-[#1A1A1D] text-[#04154D] dark:text-white border border-[#04154D]/10 dark:border-white/10 rounded-xl px-3 py-3 text-sm font-bold outline-none cursor-pointer">
-                {Array.from({ length: TOTAL_SLOTS }, (_, i) => (
-                  <option key={i} value={slotToTime(i)}>{slotLabel(i)}</option>
-                ))}
-              </select>
-            </div>
-          </div>
-
-          <button onClick={addTimeBlock} disabled={!timeBlockForm.taskId}
-            className="w-full bg-[#04154D] dark:bg-[#2A59FF] text-white font-bold text-sm py-4 rounded-2xl hover:scale-[1.02] transition-transform flex items-center justify-center gap-2 shadow-lg disabled:opacity-40">
-            <Timer size={18} /> Schedule Block
-          </button>
-        </motion.div>
-      </div>
-    );
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  "WORKING ON" OVERLAY
+  //  "WORKING ON" OVERLAY — toggle-based, Steam-style
   // ═══════════════════════════════════════════════════════════════════════════
   function renderWorkingOnOverlay() {
     if (!focusedMember) return null;
     const colors = PIC_COLORS[focusedMember];
-    const currentTask = tasks.find(t => t.pic === focusedMember && t.status === "Ongoing");
-    const nextTask    = tasks.find(t => t.pic === focusedMember && t.status === "To Do" && inWeek(t));
-    const todayBlocks = tasks.filter(t =>
-      t.pic === focusedMember &&
-      t.time_block_date === format(today, "yyyy-MM-dd") &&
-      t.time_block_start
-    ).sort((a, b) => (a.time_block_start! > b.time_block_start! ? 1 : -1));
+    const activeTaskId = workingOnTask[focusedMember];
+    const activeTask = activeTaskId ? tasks.find(t => t.id === activeTaskId) : null;
+    const memberTasks = tasks.filter(t =>
+      t.pic === focusedMember && t.status !== "Done" && t.status !== "Deferred"
+    );
+    const todayBlocks = (timeBlocks[focusedMember] || []).filter(b => b.date === format(today, "yyyy-MM-dd"))
+      .sort((a, b) => a.start > b.start ? 1 : -1);
 
     return (
       <div className="fixed inset-0 z-[110] flex items-center justify-center p-4">
@@ -1238,52 +1481,72 @@ export default function BDApp() {
           onClick={() => setFocusedMember(null)}
           className="absolute inset-0 bg-[#04154D]/70 dark:bg-black/85 backdrop-blur-sm cursor-pointer" />
         <motion.div initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.92, opacity: 0 }}
-          className="relative w-full max-w-sm bg-white dark:bg-[#121214] rounded-[2.5rem] shadow-2xl border border-[#04154D]/10 dark:border-white/10 p-8 z-10">
+          className="relative w-full max-w-sm bg-white dark:bg-[#121214] rounded-[2.5rem] shadow-2xl border border-[#04154D]/10 dark:border-white/10 p-8 z-10 max-h-[90vh] overflow-y-auto no-scrollbar">
 
           <button onClick={() => setFocusedMember(null)} className="absolute top-6 right-6 p-2 rounded-full hover:bg-[#04154D]/5 dark:hover:bg-white/5 text-[#04154D]/40 dark:text-white/40"><X size={16} /></button>
 
-          {/* Avatar */}
           <div className={`w-16 h-16 rounded-full flex items-center justify-center text-2xl font-black border-2 mx-auto mb-4 ${colors.bg} ${colors.border} ${colors.text}`}>
             {focusedMember.charAt(0)}
           </div>
           <h2 className="text-center text-xl font-black text-[#04154D] dark:text-white mb-1">{focusedMember}</h2>
-          <p className="text-center text-[10px] font-bold uppercase tracking-widest text-[#04154D]/40 dark:text-white/40 mb-6">Working On Overview</p>
 
-          {currentTask ? (
-            <div className={`p-4 rounded-2xl border mb-4 ${colors.bg} ${colors.border}`}>
+          {/* Steam-style now playing */}
+          {activeTask ? (
+            <div className={`mt-4 p-4 rounded-2xl border ${colors.bg} ${colors.border}`}>
               <div className="flex items-center gap-2 mb-2">
-                <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
-                <span className="text-[9px] font-black uppercase tracking-widest text-blue-600 dark:text-blue-400">Currently Working On</span>
+                <div className="w-2 h-2 rounded-full bg-[#2A59FF] animate-pulse" />
+                <span className="text-[9px] font-black uppercase tracking-widest text-[#2A59FF]">Currently Playing</span>
               </div>
-              <p className={`text-sm font-bold ${colors.text}`}>{currentTask.title}</p>
-              {currentTask.end_date && (
-                <p className="text-[9px] text-[#04154D]/40 dark:text-white/40 mt-1">Due {format(parseISO(currentTask.end_date), "MMM d")}</p>
-              )}
+              <p className={`text-sm font-bold ${colors.text}`}>{activeTask.title}</p>
+              <p className="text-[9px] text-[#04154D]/30 dark:text-white/30 mt-1 uppercase tracking-widest">{activeTask.urgency || "Routine"} · {activeTask.status}</p>
             </div>
           ) : (
-            <div className="p-4 rounded-2xl border border-[#04154D]/10 dark:border-white/10 mb-4 text-center">
-              <p className="text-[11px] text-[#04154D]/30 dark:text-white/30 italic">No active task</p>
+            <div className="mt-4 p-4 rounded-2xl border border-[#04154D]/8 dark:border-white/8 text-center">
+              <p className="text-[11px] text-[#04154D]/30 dark:text-white/30 italic">Idle</p>
             </div>
           )}
 
-          {nextTask && (
-            <div className="p-3 rounded-xl border border-[#04154D]/8 dark:border-white/8 mb-4">
-              <p className="text-[9px] font-black uppercase tracking-widest text-[#04154D]/30 dark:text-white/30 mb-1">Up Next</p>
-              <p className="text-xs font-bold text-[#04154D] dark:text-white">{nextTask.title}</p>
+          {/* Toggle working on */}
+          {focusedMember === loggedInUser && memberTasks.length > 0 && (
+            <div className="mt-4">
+              <p className="text-[9px] font-black uppercase tracking-widest text-[#04154D]/30 dark:text-white/30 mb-2">Switch to…</p>
+              <div className="space-y-1.5">
+                {memberTasks.map(t => (
+                  <button key={t.id}
+                    onClick={() => toggleWorkingOn(focusedMember, t.id)}
+                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border transition-all text-left
+                      ${activeTaskId === t.id
+                        ? `${colors.bg} ${colors.border} ring-1 ring-[#2A59FF]/40`
+                        : "border-[#04154D]/8 dark:border-white/8 hover:border-[#2A59FF]/30"
+                      }`}>
+                    {activeTaskId === t.id
+                      ? <Square size={12} className="text-[#2A59FF] shrink-0" fill="currentColor" />
+                      : <Play size={12} className="text-[#04154D]/30 dark:text-white/30 shrink-0" />
+                    }
+                    <span className="text-[10px] font-bold text-[#04154D] dark:text-white truncate flex-1">{t.title}</span>
+                    <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded border shrink-0 ${STATUS_COLORS[t.status]?.bg} ${STATUS_COLORS[t.status]?.border} ${STATUS_COLORS[t.status]?.text}`}>{t.status}</span>
+                  </button>
+                ))}
+              </div>
             </div>
           )}
 
           {todayBlocks.length > 0 && (
-            <div>
+            <div className="mt-5">
               <p className="text-[9px] font-black uppercase tracking-widest text-[#04154D]/30 dark:text-white/30 mb-2">Today's Schedule</p>
               <div className="space-y-2">
-                {todayBlocks.map(t => (
-                  <div key={t.id} className="flex items-center gap-3 px-3 py-2 bg-[#FBFBFD] dark:bg-[#1A1A1D] rounded-xl border border-[#04154D]/5 dark:border-white/5">
-                    <Clock size={11} className="text-[#04154D]/30 dark:text-white/30 shrink-0" />
-                    <span className="text-[9px] font-bold text-[#04154D]/50 dark:text-white/50 shrink-0">{slotLabel(timeToSlot(t.time_block_start!))} – {slotLabel(timeToSlot(t.time_block_end!))}</span>
-                    <span className="text-[10px] font-semibold text-[#04154D] dark:text-white truncate">{t.title}</span>
-                  </div>
-                ))}
+                {todayBlocks.map(b => {
+                  const t = tasks.find(x => x.id === b.taskId);
+                  return t ? (
+                    <div key={b.id} className="flex items-center gap-3 px-3 py-2 bg-[#FBFBFD] dark:bg-[#1A1A1D] rounded-xl border border-[#04154D]/5 dark:border-white/5">
+                      <Clock size={11} className="text-[#04154D]/30 dark:text-white/30 shrink-0" />
+                      <span className="text-[9px] font-bold text-[#04154D]/50 dark:text-white/50 shrink-0 tabular-nums">
+                        {slotLabel(timeToSlot(b.start))} – {slotLabel(timeToSlot(b.end))}
+                      </span>
+                      <span className="text-[10px] font-semibold text-[#04154D] dark:text-white truncate">{t.title}</span>
+                    </div>
+                  ) : null;
+                })}
               </div>
             </div>
           )}
@@ -1390,23 +1653,19 @@ export default function BDApp() {
           className="absolute inset-0 bg-[#04154D]/60 dark:bg-black/80 backdrop-blur-sm cursor-pointer" />
         <motion.div initial={{ scale: 0.93, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.93, opacity: 0 }}
           className="relative w-full max-w-sm bg-white dark:bg-[#121214] rounded-[2.5rem] shadow-2xl border border-[#04154D]/10 dark:border-white/10 p-8 z-10 flex flex-col gap-5">
-
           <div className="flex items-center justify-between">
             <h3 className="text-lg font-black text-[#04154D] dark:text-white">Defer Task</h3>
             <button onClick={() => { setDeferTask(null); setDeferDate(""); }} className="p-2 rounded-full hover:bg-[#04154D]/5 dark:hover:bg-white/5 text-[#04154D]/40 dark:text-white/40"><X size={18} /></button>
           </div>
-
           <div className="bg-slate-500/5 border border-slate-500/10 rounded-2xl px-4 py-3">
             <p className="text-sm font-bold text-[#04154D] dark:text-white truncate">{deferTask.title}</p>
           </div>
-
           <div>
-            <label className="text-[10px] font-bold uppercase tracking-widest text-[#04154D]/40 dark:text-white/40 block mb-2">Defer Until (must be a future date)</label>
+            <label className="text-[10px] font-bold uppercase tracking-widest text-[#04154D]/40 dark:text-white/40 block mb-2">Defer Until</label>
             <input type="date" min={minDate} value={deferDate} onChange={e => setDeferDate(e.target.value)}
               className="w-full bg-[#FBFBFD] dark:bg-[#1A1A1D] text-[#04154D] dark:text-white border border-[#04154D]/10 dark:border-white/10 rounded-xl px-4 py-3 text-sm font-bold outline-none" />
             <p className="text-[9px] text-[#04154D]/30 dark:text-white/30 mt-2">The task will be hidden until this date.</p>
           </div>
-
           <button onClick={handleDefer} disabled={!deferDate}
             className="w-full bg-slate-600 text-white font-bold text-sm py-4 rounded-2xl hover:scale-[1.02] transition-transform flex items-center justify-center gap-2 shadow-lg disabled:opacity-40">
             <Clock size={18} /> Defer Task
@@ -1508,21 +1767,6 @@ export default function BDApp() {
               </div>
             </div>
 
-            {/* Time block section in enrich */}
-            {enrichTask.time_block_date && (
-              <div className="bg-[#2A59FF]/5 border border-[#2A59FF]/20 rounded-2xl px-5 py-4">
-                <div className="flex items-center gap-2 mb-1">
-                  <Timer size={13} className="text-[#2A59FF]" />
-                  <span className="text-[9px] font-black uppercase tracking-widest text-[#2A59FF]">Time Blocked</span>
-                </div>
-                <p className="text-sm font-bold text-[#04154D] dark:text-white">
-                  {enrichTask.time_block_date} · {enrichTask.time_block_start ? slotLabel(timeToSlot(enrichTask.time_block_start)) : ""} – {enrichTask.time_block_end ? slotLabel(timeToSlot(enrichTask.time_block_end)) : ""}
-                </p>
-                <button onClick={() => updateTask(enrichTask.id, { time_block_date: null, time_block_start: null, time_block_end: null })}
-                  className="text-[9px] font-bold text-red-500 mt-2 hover:underline">Remove block</button>
-              </div>
-            )}
-
             <div>
               <label className="text-[10px] font-bold uppercase tracking-widest text-[#04154D]/40 dark:text-white/40 flex items-center gap-2 mb-2">
                 <FileText size={13} /> Notes
@@ -1612,11 +1856,11 @@ export default function BDApp() {
     const myOngoing = myTasks.filter(t => t.status === "Ongoing");
     const myUrgent  = myTasks.filter(t => t.urgency === "Urgent" && t.status !== "Done" && t.status !== "Ongoing");
     const myOverdue = myTasks.filter(isOverdue);
-    const myToday   = tasks.filter(t => t.pic === loggedInUser && t.time_block_date === format(today, "yyyy-MM-dd") && t.time_block_start);
+    const activeTaskId = loggedInUser ? workingOnTask[loggedInUser] : null;
+    const activeTask = activeTaskId ? tasks.find(t => t.id === activeTaskId) : null;
 
     return (
       <div className={`flex flex-col h-[100dvh] w-full overflow-hidden bg-[#050505] text-white ${isDarkMode ? "dark" : ""}`}>
-        {/* Top bar */}
         <div className="flex items-center justify-between px-5 pt-safe pt-4 pb-4 shrink-0 border-b border-white/5">
           <div>
             <h1 className="text-lg font-black text-white">BD TEAM</h1>
@@ -1635,67 +1879,41 @@ export default function BDApp() {
           </div>
         </div>
 
-        {/* Scrollable content */}
         <div className="flex-1 overflow-y-auto no-scrollbar px-5 py-4 space-y-4">
-
-          {/* Active task */}
+          {/* Steam-style now playing */}
           <div className="bg-[#2A59FF]/10 border border-[#2A59FF]/20 rounded-3xl p-5">
             <p className="text-[9px] font-black uppercase tracking-widest text-[#2A59FF] mb-2 flex items-center gap-1.5">
-              <div className="w-1.5 h-1.5 rounded-full bg-[#2A59FF] animate-pulse" /> Active
+              <div className="w-1.5 h-1.5 rounded-full bg-[#2A59FF] animate-pulse" /> Working On
             </p>
-            {myOngoing.length > 0 ? (
-              <div className="space-y-2">
-                {myOngoing.map(t => (
-                  <div key={t.id} className="flex items-center gap-2">
-                    <p className="text-sm font-bold text-white flex-1 truncate">{t.title}</p>
-                    <button onClick={() => updateTask(t.id, { status: "Done" })}
-                      className="shrink-0 p-1.5 bg-emerald-500/20 rounded-lg text-emerald-400">
-                      <CheckCircle2 size={14} />
-                    </button>
-                  </div>
-                ))}
+            {activeTask ? (
+              <div className="flex items-center gap-2">
+                <p className="text-sm font-bold text-white flex-1 truncate">{activeTask.title}</p>
+                <button onClick={() => toggleWorkingOn(loggedInUser!, activeTask.id)}
+                  className="shrink-0 p-1.5 bg-white/10 rounded-lg text-white/50">
+                  <Square size={12} fill="currentColor" />
+                </button>
               </div>
             ) : (
-              <p className="text-sm text-white/30 italic">Nothing active right now</p>
+              <p className="text-sm text-white/30 italic">Nothing playing</p>
             )}
           </div>
 
-          {/* Overdue alert */}
           {myOverdue.length > 0 && (
             <div className="bg-red-500/10 border border-red-500/20 rounded-2xl p-4 flex items-center gap-3">
               <AlertCircle size={18} className="text-red-400 shrink-0" />
               <div>
-                <p className="text-xs font-black text-red-400">{myOverdue.length} overdue task{myOverdue.length > 1 ? "s" : ""}</p>
+                <p className="text-xs font-black text-red-400">{myOverdue.length} overdue</p>
                 <p className="text-[10px] text-red-400/60">{myOverdue.map(t => t.title).join(", ")}</p>
               </div>
             </div>
           )}
 
-          {/* Today's time blocks */}
-          {myToday.length > 0 && (
-            <div>
-              <p className="text-[10px] font-black uppercase tracking-widest text-white/30 mb-2">Today's Schedule</p>
-              <div className="space-y-2">
-                {myToday.sort((a,b) => a.time_block_start! > b.time_block_start! ? 1 : -1).map(t => (
-                  <div key={t.id} className="flex items-center gap-3 bg-white/5 border border-white/8 rounded-xl px-4 py-3">
-                    <Clock size={13} className="text-white/30 shrink-0" />
-                    <span className="text-[9px] font-bold text-white/30 shrink-0 tabular-nums">
-                      {slotLabel(timeToSlot(t.time_block_start!))}
-                    </span>
-                    <span className="text-xs font-semibold text-white truncate flex-1">{t.title}</span>
-                    <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded border ${STATUS_COLORS[t.status]?.bg} ${STATUS_COLORS[t.status]?.border} ${STATUS_COLORS[t.status]?.text}`}>{t.status}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Team quick view */}
           <div>
             <p className="text-[10px] font-black uppercase tracking-widest text-white/30 mb-2">Team Status</p>
             <div className="space-y-2">
               {TEAM_MEMBERS.filter(m => m !== loggedInUser).map(m => {
-                const active = tasks.find(t => t.pic === m && t.status === "Ongoing");
+                const memberActiveId = workingOnTask[m];
+                const memberActiveTask = memberActiveId ? tasks.find(t => t.id === memberActiveId) : null;
                 const c = PIC_COLORS[m];
                 return (
                   <button key={m} onClick={() => setFocusedMember(m)}
@@ -1703,7 +1921,9 @@ export default function BDApp() {
                     <div className={`w-7 h-7 rounded-full flex items-center justify-center text-[11px] font-black border ${c.bg} ${c.border} ${c.text}`}>{m.charAt(0)}</div>
                     <div className="flex-1 min-w-0 text-left">
                       <p className={`text-xs font-bold ${c.text}`}>{m}</p>
-                      <p className="text-[9px] text-white/30 truncate">{active ? active.title : "No active task"}</p>
+                      <p className="text-[9px] text-white/30 truncate">
+                        {memberActiveTask ? `▶ ${memberActiveTask.title}` : "Not playing anything"}
+                      </p>
                     </div>
                     <Eye size={13} className="text-white/20 shrink-0" />
                   </button>
@@ -1712,7 +1932,6 @@ export default function BDApp() {
             </div>
           </div>
 
-          {/* Urgent */}
           {myUrgent.length > 0 && (
             <div>
               <p className="text-[10px] font-black uppercase tracking-widest text-red-400 mb-2">Urgent</p>
@@ -1721,6 +1940,12 @@ export default function BDApp() {
                   <div key={t.id} className="flex items-center gap-3 bg-red-500/5 border border-red-500/20 rounded-xl px-4 py-3">
                     <div className="w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" />
                     <span className="text-xs font-semibold text-white flex-1 truncate">{t.title}</span>
+                    <button
+                      onClick={() => toggleWorkingOn(loggedInUser!, t.id)}
+                      className={`shrink-0 p-1.5 rounded-lg transition-colors ${workingOnTask[loggedInUser!] === t.id ? "bg-[#2A59FF] text-white" : "bg-white/5 text-white/40"}`}
+                    >
+                      {workingOnTask[loggedInUser!] === t.id ? <Square size={12} fill="currentColor" /> : <Play size={12} />}
+                    </button>
                     <select value={t.status} onChange={e => updateTask(t.id, { status: e.target.value })}
                       onClick={e => e.stopPropagation()}
                       className="text-[9px] font-bold px-2 py-1 rounded-lg border outline-none cursor-pointer bg-transparent text-white border-white/10">
@@ -1733,7 +1958,6 @@ export default function BDApp() {
           )}
         </div>
 
-        {/* Bottom FAB */}
         <div className="shrink-0 px-5 pb-safe pb-6 pt-3 border-t border-white/5">
           <button onClick={() => setShowQuickAdd(true)}
             className="w-full bg-[#2A59FF] text-white font-bold text-sm py-4 rounded-2xl flex items-center justify-center gap-2 shadow-lg shadow-[#2A59FF]/30">
@@ -1741,7 +1965,6 @@ export default function BDApp() {
           </button>
         </div>
 
-        {/* Portals */}
         <AnimatePresence>{focusedMember && renderWorkingOnOverlay()}</AnimatePresence>
         <AnimatePresence>{showQuickAdd && renderQuickAdd()}</AnimatePresence>
         <AnimatePresence>{deferTask && renderDeferModal()}</AnimatePresence>
@@ -1756,7 +1979,6 @@ export default function BDApp() {
     <div className={`h-[100dvh] w-full overflow-hidden transition-colors duration-300 ${isDarkMode ? "dark" : ""}`}>
       <div className="flex flex-col h-full w-full bg-[#FBFBFD] dark:bg-[#050505] text-[#04154D] dark:text-[#FBFBFD]">
 
-        {/* ════════════ TOP NAV ════════════ */}
         <header className="shrink-0 h-14 flex items-center justify-between px-4 md:px-6 bg-[#FBFBFD] dark:bg-[#050505] border-b border-[#04154D]/5 dark:border-white/5 z-20">
           <div className="flex items-center gap-4 md:gap-5">
             <span className="text-base font-black tracking-tight text-[#04154D] dark:text-white">BD TEAM</span>
@@ -1778,6 +2000,16 @@ export default function BDApp() {
           </div>
 
           <div className="flex items-center gap-2">
+            {/* Steam-style "now playing" in nav */}
+            {loggedInUser && workingOnTask[loggedInUser] && (() => {
+              const t = tasks.find(x => x.id === workingOnTask[loggedInUser!]);
+              return t ? (
+                <div className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-[#2A59FF]/8 border border-[#2A59FF]/20 rounded-xl">
+                  <div className="w-1.5 h-1.5 rounded-full bg-[#2A59FF] animate-pulse" />
+                  <span className="text-[10px] font-bold text-[#2A59FF] max-w-[180px] truncate">{t.title}</span>
+                </div>
+              ) : null;
+            })()}
             <button onClick={() => setIsDarkMode(p => !p)}
               className="p-2 rounded-xl text-[#04154D]/40 dark:text-white/40 hover:bg-[#04154D]/5 dark:hover:bg-white/5 transition-colors">
               {isDarkMode ? <Sun size={16} /> : <Moon size={16} />}
@@ -1793,7 +2025,6 @@ export default function BDApp() {
           </div>
         </header>
 
-        {/* ════════════ MAIN CANVAS ════════════ */}
         <main className="flex-1 relative min-h-0 overflow-hidden
           bg-white dark:bg-[#0A0A0C]
           rounded-tl-[28px] rounded-tr-[28px]
@@ -1807,11 +2038,9 @@ export default function BDApp() {
         </main>
       </div>
 
-      {/* ════════════ PORTALS ════════════ */}
       <AnimatePresence>{enrichTask && renderEnrichModal()}</AnimatePresence>
       <AnimatePresence>{showForReview && renderReviews()}</AnimatePresence>
       <AnimatePresence>{showQuickAdd && renderQuickAdd()}</AnimatePresence>
-      <AnimatePresence>{showTimeBlockAdd && renderTimeBlockAdd()}</AnimatePresence>
       <AnimatePresence>{deferTask && renderDeferModal()}</AnimatePresence>
       <AnimatePresence>{focusedMember && renderWorkingOnOverlay()}</AnimatePresence>
     </div>
