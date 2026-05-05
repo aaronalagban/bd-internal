@@ -33,6 +33,7 @@ type Task = {
   urgency?: "Urgent" | "Routine" | "Scheduled";
   is_colleague_request?: boolean;
   links?: string;
+  tagged_members?: string[];
 };
 
 // A single time block entry (multiple per task allowed)
@@ -44,7 +45,7 @@ type TimeBlock = {
   end: string;   // "HH:MM"
 };
 
-type ViewMode = "dashboard" | "calendar" | "timeblock";
+type ViewMode = "dashboard" | "workload" | "calendar" | "timeblock";
 type UserScope = "member" | "team";
 type TeamMember = "Bien" | "Aaron" | "Michelle";
 
@@ -117,7 +118,13 @@ const isOverdue = (task: Task): boolean => {
 };
 
 function generateId(): string {
-  return Math.random().toString(36).slice(2, 10);
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === "x" ? r : (r & 0x3 | 0x8)).toString(16);
+  });
 }
 
 // ─── REAL-TIME INPUT ──────────────────────────────────────────────────────────
@@ -213,7 +220,7 @@ export default function BDApp() {
   // ── quick-add form ──
   const [newTask, setNewTask] = useState<Partial<Task>>({
     title: "", urgency: "Routine", is_colleague_request: false,
-    start_date: "", end_date: "", pic: "",
+    start_date: "", end_date: "", pic: "", tagged_members: [],
   });
 
   // ── mobile ──
@@ -315,17 +322,24 @@ export default function BDApp() {
   const addTask = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newTask.title || !loggedInUser) return;
-    const finalPic = loggedInUser === "Michelle" && newTask.pic ? newTask.pic : loggedInUser;
+    const finalPic = newTask.pic || loggedInUser;
     const { data, error } = await supabase.from("tasks").insert([{
       ...newTask, pic: finalPic, status: "To Do",
       start_date: newTask.start_date || null,
       end_date: newTask.end_date || null,
+      tagged_members: newTask.tagged_members || [],
     }]).select();
     if (!error && data) {
       setTasks(p => p.find(t => t.id === data[0].id) ? p : [...p, data[0]]);
-      setNewTask({ title: "", urgency: "Routine", is_colleague_request: false, start_date: "", end_date: "", notes: "", links: "", pic: loggedInUser });
+      setNewTask({ title: "", urgency: "Routine", is_colleague_request: false, start_date: "", end_date: "", notes: "", links: "", pic: loggedInUser, tagged_members: [] });
       setShowQuickAdd(false);
     }
+  };
+
+  const deleteTask = async (id: string) => {
+    setTasks(p => p.filter(t => t.id !== id));
+    setEnrichTask(null);
+    await supabase.from("tasks").delete().eq("id", id);
   };
 
   const updateTask = async (id: string, updates: Partial<Task>) => {
@@ -439,13 +453,16 @@ export default function BDApp() {
     return s <= weekEnd && e >= weekStart;
   }, [weekStart, weekEnd]);
 
-  const visibleTasks = userScope === "team" ? tasks : tasks.filter(t => t.pic === loggedInUser);
+  const isTaskVisibleToMe = (t: Task) =>
+    t.pic === loggedInUser || (t.tagged_members || []).includes(loggedInUser!);
+
+  const visibleTasks = userScope === "team" ? tasks : tasks.filter(isTaskVisibleToMe);
   const weekTasks    = visibleTasks.filter(t => inWeek(t) && t.status !== "Deferred");
   const unscheduled  = visibleTasks.filter(t => !t.start_date && t.status !== "Deferred" && t.status !== "Done");
 
   const overdueCount  = weekTasks.filter(isOverdue).length;
   const doneCount     = weekTasks.filter(t => t.status === "Done").length;
-  const forReviewAll  = tasks.filter(t => t.status === "For Review" && (userScope === "team" || t.pic === loggedInUser));
+  const forReviewAll  = tasks.filter(t => t.status === "For Review" && (userScope === "team" || isTaskVisibleToMe(t)));
 
   const urgentTasks   = weekTasks.filter(t => t.urgency === "Urgent"  && t.status !== "Done");
   const routineTasks  = weekTasks.filter(t => t.urgency !== "Urgent"  && t.status !== "Done");
@@ -747,30 +764,100 @@ export default function BDApp() {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  //  DASHBOARD
+  //  DASHBOARD (Kanban)
   // ═══════════════════════════════════════════════════════════════════════════
   function renderDashboard() {
+    const overdueBacklog = visibleTasks.filter(t => {
+      if (t.status === "Done" || t.status === "Deferred") return false;
+      const ref = t.end_date || t.start_date;
+      if (!ref) return false;
+      return isBefore(parseISO(ref), weekStart) && !isSameDay(parseISO(ref), weekStart);
+    });
+
+    const colDefs = [
+      { status: "To Do",      label: "To Do",       dot: "bg-slate-400",   text: "text-slate-600 dark:text-slate-300",     headerBg: "bg-slate-500/5 dark:bg-slate-500/10",    pulse: false },
+      { status: "Ongoing",    label: "In Progress",  dot: "bg-blue-500",    text: "text-blue-700 dark:text-blue-400",       headerBg: "bg-blue-500/5 dark:bg-blue-500/10",      pulse: true  },
+      { status: "For Review", label: "For Review",   dot: "bg-amber-500",   text: "text-amber-700 dark:text-amber-400",     headerBg: "bg-amber-500/5 dark:bg-amber-500/10",    pulse: false },
+      { status: "Done",       label: "Done",         dot: "bg-emerald-500", text: "text-emerald-700 dark:text-emerald-400", headerBg: "bg-emerald-500/5 dark:bg-emerald-500/10", pulse: false },
+    ] as const;
+
+    function KanbanCard({ task }: { task: Task }) {
+      const isDone = task.status === "Done";
+      const overdue = isOverdue(task);
+      const ref = task.end_date || task.start_date;
+      const uColor = URGENCY_COLORS[task.urgency || "Routine"];
+      const isWorking = loggedInUser ? workingOnTask[loggedInUser] === task.id : false;
+
+      return (
+        <motion.div layout initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+          onClick={() => setEnrichTask(task)}
+          className={`group p-3 rounded-2xl border cursor-pointer transition-all hover:shadow-sm
+            ${isDone ? "opacity-40 bg-[#FBFBFD] dark:bg-[#1A1A1D] border-[#04154D]/5 dark:border-white/5" :
+              isWorking ? "ring-2 ring-[#2A59FF]/40 bg-[#2A59FF]/5 border-[#2A59FF]/30" :
+              overdue ? "bg-red-500/5 dark:bg-red-500/10 border-red-500/20" :
+              "bg-white dark:bg-[#1A1A1D] border-[#04154D]/8 dark:border-white/8 hover:border-[#2A59FF]/30"
+            }`}>
+          <div className="flex items-start gap-2 mb-2">
+            <button onClick={e => {
+              e.stopPropagation();
+              const next = isDone ? "To Do" : task.status === "To Do" ? "Ongoing" : task.status === "Ongoing" ? "Done" : "Done";
+              updateTask(task.id, { status: next });
+            }} className="shrink-0 mt-0.5">
+              {isDone ? <CheckCircle2 size={14} className="text-emerald-500" /> :
+                <Circle size={14} className={`transition-colors group-hover:text-[#2A59FF] ${overdue ? "text-red-400" : "text-[#04154D]/20 dark:text-white/20"}`} />}
+            </button>
+            <div className={`w-1.5 h-1.5 rounded-full shrink-0 mt-1 ${uColor.dot}`} />
+            <span className={`flex-1 text-[11px] font-semibold leading-snug ${isDone ? "line-through text-[#04154D]/40 dark:text-white/40" : "text-[#04154D] dark:text-white"}`}>
+              {task.title}
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {ref && (
+              <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded border ${overdue && !isDone ? "bg-red-500/10 border-red-500/20 text-red-600 dark:text-red-400" : "bg-[#04154D]/5 dark:bg-white/5 border-[#04154D]/10 dark:border-white/10 text-[#04154D]/50 dark:text-white/50"}`}>
+                {format(parseISO(ref), "MMM d")}
+              </span>
+            )}
+            {task.is_colleague_request && (
+              <span className="text-[8px] font-bold px-1.5 py-0.5 rounded border bg-purple-500/10 border-purple-500/20 text-purple-600 dark:text-purple-400">Collab</span>
+            )}
+            {(task.tagged_members || []).map(m => (
+              <span key={m} className={`text-[8px] font-bold px-1.5 py-0.5 rounded border ${PIC_COLORS[m]?.bg} ${PIC_COLORS[m]?.border} ${PIC_COLORS[m]?.text}`}>{m.charAt(0)}</span>
+            ))}
+            {userScope === "team" && (
+              <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-black border ml-auto ${PIC_COLORS[task.pic]?.bg} ${PIC_COLORS[task.pic]?.border} ${PIC_COLORS[task.pic]?.text}`}>
+                {task.pic.charAt(0)}
+              </div>
+            )}
+            {!isDone && task.pic === loggedInUser && (
+              <button onClick={e => { e.stopPropagation(); toggleWorkingOn(loggedInUser!, task.id); }}
+                className={`ml-auto flex items-center gap-1 px-1.5 py-0.5 rounded-lg text-[8px] font-bold border transition-all
+                  ${isWorking ? "bg-[#2A59FF] border-[#2A59FF] text-white" : "border-[#04154D]/10 dark:border-white/10 text-[#04154D]/30 dark:text-white/30 hover:border-[#2A59FF]/40 hover:text-[#2A59FF]"}`}>
+                {isWorking ? <><Square size={7} fill="currentColor" /> On</> : <><Play size={7} /> Do</>}
+              </button>
+            )}
+          </div>
+        </motion.div>
+      );
+    }
+
     return (
       <motion.div key="dash" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
         className="absolute inset-0 flex overflow-hidden">
 
         <div className="flex-1 flex flex-col min-w-0 overflow-hidden border-r border-[#04154D]/5 dark:border-white/5">
-          <div className="flex items-center justify-between px-6 md:px-8 pt-5 md:pt-7 pb-4 md:pb-5 shrink-0 flex-wrap gap-3">
+          {/* Header */}
+          <div className="flex items-center justify-between px-6 md:px-8 pt-5 md:pt-7 pb-4 shrink-0 flex-wrap gap-3">
             <div>
               <div className="flex items-center gap-3">
                 <h2 className="text-2xl md:text-3xl font-black text-[#04154D] dark:text-white tracking-tight leading-tight">
                   {isCurrentWeek ? format(today, "EEEE, MMMM do") : "Past / Future Week"}
                 </h2>
                 <div className="flex items-center gap-1 bg-white dark:bg-[#1A1A1D] border border-[#04154D]/10 dark:border-white/10 rounded-xl px-2 py-1">
-                  <button onClick={() => setWeekOffset(p => p - 1)} className="p-1 rounded-lg hover:bg-[#04154D]/5 dark:hover:bg-white/5 transition-colors text-[#04154D] dark:text-white">
-                    <ChevronLeft size={14} />
-                  </button>
+                  <button onClick={() => setWeekOffset(p => p - 1)} className="p-1 rounded-lg hover:bg-[#04154D]/5 dark:hover:bg-white/5 transition-colors text-[#04154D] dark:text-white"><ChevronLeft size={14} /></button>
                   <button onClick={() => setWeekOffset(0)} className={`text-[9px] font-bold px-2 py-0.5 rounded transition-colors ${isCurrentWeek ? "text-[#2A59FF]" : "text-[#04154D]/50 dark:text-white/50 hover:text-[#2A59FF]"}`}>
                     {isCurrentWeek ? "This Week" : weekOffset < 0 ? `${Math.abs(weekOffset)}w ago` : `+${weekOffset}w`}
                   </button>
-                  <button onClick={() => setWeekOffset(p => p + 1)} className="p-1 rounded-lg hover:bg-[#04154D]/5 dark:hover:bg-white/5 transition-colors text-[#04154D] dark:text-white">
-                    <ChevronRight size={14} />
-                  </button>
+                  <button onClick={() => setWeekOffset(p => p + 1)} className="p-1 rounded-lg hover:bg-[#04154D]/5 dark:hover:bg-white/5 transition-colors text-[#04154D] dark:text-white"><ChevronRight size={14} /></button>
                 </div>
               </div>
               <p className="text-[#2A59FF] font-bold uppercase tracking-widest text-xs mt-1">
@@ -789,12 +876,13 @@ export default function BDApp() {
             </div>
           </div>
 
-          <div className="grid grid-cols-4 gap-2 md:gap-3 px-6 md:px-8 pb-4 md:pb-5 shrink-0">
+          {/* Stats */}
+          <div className="grid grid-cols-4 gap-2 md:gap-3 px-6 md:px-8 pb-3 shrink-0">
             {[
               { label: "Done", value: `${doneCount}/${weekTasks.length}`, color: "text-[#2A59FF]", bg: "bg-white dark:bg-[#121214]", border: "border-[#04154D]/10 dark:border-white/10" },
-              { label: "Overdue", value: overdueCount, color: overdueCount > 0 ? "text-red-600 dark:text-red-400" : "text-[#04154D] dark:text-white", bg: overdueCount > 0 ? "bg-red-500/5 dark:bg-red-500/10" : "bg-white dark:bg-[#121214]", border: overdueCount > 0 ? "border-red-500/20" : "border-[#04154D]/10 dark:border-white/10" },
+              { label: "In Progress", value: weekTasks.filter(t => t.status === "Ongoing").length, color: "text-blue-600 dark:text-blue-400", bg: "bg-white dark:bg-[#121214]", border: "border-[#04154D]/10 dark:border-white/10" },
               { label: "For Review", value: forReviewAll.length, color: forReviewAll.length > 0 ? "text-[#FF5B24]" : "text-[#04154D] dark:text-white", bg: forReviewAll.length > 0 ? "bg-[#FF5B24]/5" : "bg-white dark:bg-[#121214]", border: forReviewAll.length > 0 ? "border-[#FF5B24]/20" : "border-[#04154D]/10 dark:border-white/10" },
-              { label: "Unscheduled", value: unscheduled.length, color: "text-[#04154D] dark:text-white", bg: "bg-white dark:bg-[#121214]", border: "border-[#04154D]/10 dark:border-white/10" },
+              { label: "Past Due", value: overdueBacklog.length, color: overdueBacklog.length > 0 ? "text-red-600 dark:text-red-400" : "text-[#04154D] dark:text-white", bg: overdueBacklog.length > 0 ? "bg-red-500/5 dark:bg-red-500/10" : "bg-white dark:bg-[#121214]", border: overdueBacklog.length > 0 ? "border-red-500/20" : "border-[#04154D]/10 dark:border-white/10" },
             ].map(s => (
               <div key={s.label} className={`${s.bg} border ${s.border} rounded-2xl px-3 md:px-4 py-2 md:py-3`}>
                 <p className="text-[9px] md:text-[10px] font-bold uppercase tracking-widest text-[#04154D]/40 dark:text-white/40 mb-1">{s.label}</p>
@@ -803,72 +891,79 @@ export default function BDApp() {
             ))}
           </div>
 
-          <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-6 md:px-8 pb-8 space-y-5">
-            {urgentTasks.length > 0 && (
-              <div>
-                <div className="flex items-center gap-2 mb-2.5">
-                  <div className="w-1.5 h-1.5 rounded-full bg-red-500" />
-                  <span className="text-[10px] font-black uppercase tracking-widest text-red-600 dark:text-red-400">Urgent</span>
-                  <span className="text-[10px] font-bold text-[#04154D]/25 dark:text-white/25">({urgentTasks.length})</span>
+          {/* Overdue backlog banner */}
+          {overdueBacklog.length > 0 && (
+            <div className="px-6 md:px-8 pb-3 shrink-0">
+              <div className="bg-red-500/5 dark:bg-red-500/10 border border-red-500/20 rounded-2xl p-3">
+                <div className="flex items-center gap-2 mb-2">
+                  <AlertCircle size={12} className="text-red-500 shrink-0" />
+                  <span className="text-[10px] font-black uppercase tracking-widest text-red-600 dark:text-red-400">Backlog — Overdue from past weeks ({overdueBacklog.length})</span>
                 </div>
-                <div className="flex flex-col gap-2">
-                  <AnimatePresence>{urgentTasks.map(t => <TaskRow key={t.id} task={t} />)}</AnimatePresence>
-                </div>
-              </div>
-            )}
-
-            {routineTasks.length > 0 && (
-              <div>
-                <div className="flex items-center gap-2 mb-2.5">
-                  <div className="w-1.5 h-1.5 rounded-full bg-slate-400" />
-                  <span className="text-[10px] font-black uppercase tracking-widest text-[#04154D]/50 dark:text-white/50">Routine & Scheduled</span>
-                  <span className="text-[10px] font-bold text-[#04154D]/25 dark:text-white/25">({routineTasks.length})</span>
-                </div>
-                <div className="flex flex-col gap-2">
-                  <AnimatePresence>{routineTasks.map(t => <TaskRow key={t.id} task={t} />)}</AnimatePresence>
-                </div>
-              </div>
-            )}
-
-            {doneTasks.length > 0 && (
-              <div>
-                <div className="flex items-center gap-2 mb-2.5">
-                  <CheckCircle2 size={12} className="text-emerald-500" />
-                  <span className="text-[10px] font-black uppercase tracking-widest text-emerald-600 dark:text-emerald-400">Completed</span>
-                  <span className="text-[10px] font-bold text-[#04154D]/25 dark:text-white/25">({doneTasks.length})</span>
-                </div>
-                <div className="flex flex-col gap-2">
-                  <AnimatePresence>{doneTasks.map(t => <TaskRow key={t.id} task={t} />)}</AnimatePresence>
+                <div className="flex gap-2 overflow-x-auto no-scrollbar pb-1">
+                  {overdueBacklog.map(t => {
+                    const ref = t.end_date || t.start_date;
+                    return (
+                      <div key={t.id} onClick={() => setEnrichTask(t)}
+                        className="shrink-0 min-w-[160px] max-w-[200px] p-2.5 bg-white dark:bg-[#1A1A1D] border border-red-500/30 rounded-xl cursor-pointer hover:border-red-500/60 transition-colors">
+                        <p className="text-[10px] font-bold text-[#04154D] dark:text-white truncate mb-1">{t.title}</p>
+                        <div className="flex items-center gap-1.5">
+                          {ref && <span className="text-[8px] font-bold text-red-600 dark:text-red-400">{format(parseISO(ref), "MMM d")}</span>}
+                          {userScope === "team" && (
+                            <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded border ${PIC_COLORS[t.pic]?.bg} ${PIC_COLORS[t.pic]?.border} ${PIC_COLORS[t.pic]?.text}`}>{t.pic}</span>
+                          )}
+                          <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded border ml-auto ${STATUS_COLORS[t.status]?.bg} ${STATUS_COLORS[t.status]?.border} ${STATUS_COLORS[t.status]?.text}`}>{t.status}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
-            )}
+            </div>
+          )}
 
-            {weekTasks.length === 0 && unscheduled.length === 0 && (
-              <div className="text-center py-16 text-[#04154D]/20 dark:text-white/20">
-                <Activity size={40} className="mx-auto mb-3 opacity-30" />
-                <p className="font-black uppercase tracking-widest text-sm">Nothing this week.</p>
-              </div>
-            )}
-
-            {unscheduled.length > 0 && (
-              <div className="pt-5 border-t border-[#04154D]/5 dark:border-white/5">
-                <div className="flex items-center gap-2 mb-3">
-                  <Clock size={12} className="text-yellow-500" />
-                  <span className="text-[10px] font-black uppercase tracking-widest text-yellow-600 dark:text-yellow-400">Unscheduled Inbox</span>
-                  <span className="text-[10px] font-bold text-[#04154D]/25 dark:text-white/25">({unscheduled.length})</span>
-                </div>
-                <div className="flex gap-3 overflow-x-auto no-scrollbar pb-2">
-                  {unscheduled.map(t => (
-                    <div key={t.id} onClick={() => setEnrichTask(t)}
-                      className="min-w-[180px] max-w-[220px] p-3 bg-yellow-500/5 border border-yellow-500/20 rounded-2xl cursor-pointer hover:border-yellow-500/50 transition-colors shrink-0">
-                      <p className="text-xs font-bold text-[#04154D] dark:text-white truncate mb-1">{t.title}</p>
-                      <p className="text-[9px] font-bold text-yellow-600 dark:text-yellow-400 uppercase tracking-widest">Click to schedule →</p>
+          {/* Kanban board */}
+          <div className="flex-1 min-h-0 flex gap-3 px-6 md:px-8 pb-5 overflow-hidden">
+            {colDefs.map(col => {
+              const colTasks = weekTasks.filter(t => t.status === col.status);
+              const colUnscheduled = col.status === "To Do" ? unscheduled : [];
+              return (
+                <div key={col.status} className={`flex-1 flex flex-col min-w-0 overflow-hidden rounded-2xl border border-[#04154D]/8 dark:border-white/8`}>
+                  <div className={`px-3 py-2.5 ${col.headerBg} border-b border-[#04154D]/8 dark:border-white/8 shrink-0`}>
+                    <div className="flex items-center gap-2">
+                      <div className={`w-2 h-2 rounded-full ${col.dot} ${col.pulse ? "animate-pulse" : ""}`} />
+                      <span className={`text-[10px] font-black uppercase tracking-widest ${col.text}`}>{col.label}</span>
+                      <span className="text-[9px] font-bold text-[#04154D]/30 dark:text-white/30 ml-auto bg-[#04154D]/5 dark:bg-white/5 rounded-full px-2 py-0.5">
+                        {colTasks.length}
+                      </span>
                     </div>
-                  ))}
+                  </div>
+                  <div className="flex-1 overflow-y-auto no-scrollbar p-2 space-y-2">
+                    <AnimatePresence>
+                      {colTasks.map(t => <KanbanCard key={t.id} task={t} />)}
+                    </AnimatePresence>
+                    {colTasks.length === 0 && colUnscheduled.length === 0 && (
+                      <p className="text-center text-[9px] text-[#04154D]/15 dark:text-white/15 italic pt-4">Empty</p>
+                    )}
+                    {colUnscheduled.length > 0 && (
+                      <div className="pt-2">
+                        <div className="flex items-center gap-1.5 mb-2 px-1">
+                          <div className="flex-1 h-px bg-[#04154D]/10 dark:bg-white/10" />
+                          <span className="text-[8px] font-black uppercase tracking-widest text-[#04154D]/25 dark:text-white/25 flex items-center gap-1">
+                            <Clock size={8} /> Inbox
+                          </span>
+                          <div className="flex-1 h-px bg-[#04154D]/10 dark:bg-white/10" />
+                        </div>
+                        <AnimatePresence>
+                          {colUnscheduled.map(t => <KanbanCard key={t.id} task={t} />)}
+                        </AnimatePresence>
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
-            )}
+              );
+            })}
           </div>
+
         </div>
 
         {/* RIGHT PANEL */}
@@ -903,6 +998,111 @@ export default function BDApp() {
               <Plus size={18} /> Quick Add Task
             </button>
           </div>
+        </div>
+      </motion.div>
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  TEAM WORKLOAD
+  // ═══════════════════════════════════════════════════════════════════════════
+  function renderWorkload() {
+    const thisWeekTasks = tasks.filter(t => inWeek(t) && t.status !== "Deferred");
+
+    return (
+      <motion.div key="wl" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+        className="absolute inset-0 flex flex-col overflow-hidden">
+
+        <div className="flex items-center justify-between px-6 md:px-8 pt-5 md:pt-7 pb-4 shrink-0 border-b border-[#04154D]/5 dark:border-white/5">
+          <div>
+            <h2 className="text-2xl md:text-3xl font-black text-[#04154D] dark:text-white tracking-tight">Team Workload</h2>
+            <p className="text-[#2A59FF] font-bold uppercase tracking-widest text-xs mt-1">
+              {format(weekStart, "MMM d")} – {format(weekEnd, "MMM d, yyyy")}
+            </p>
+          </div>
+          <div className="flex items-center gap-1 bg-white dark:bg-[#1A1A1D] border border-[#04154D]/10 dark:border-white/10 rounded-xl px-2 py-1">
+            <button onClick={() => setWeekOffset(p => p - 1)} className="p-1 rounded-lg hover:bg-[#04154D]/5 dark:hover:bg-white/5 transition-colors text-[#04154D] dark:text-white"><ChevronLeft size={14} /></button>
+            <button onClick={() => setWeekOffset(0)} className={`text-[9px] font-bold px-2 py-0.5 rounded transition-colors ${weekOffset === 0 ? "text-[#2A59FF]" : "text-[#04154D]/50 dark:text-white/50 hover:text-[#2A59FF]"}`}>
+              {weekOffset === 0 ? "This Week" : weekOffset < 0 ? `${Math.abs(weekOffset)}w ago` : `+${weekOffset}w`}
+            </button>
+            <button onClick={() => setWeekOffset(p => p + 1)} className="p-1 rounded-lg hover:bg-[#04154D]/5 dark:hover:bg-white/5 transition-colors text-[#04154D] dark:text-white"><ChevronRight size={14} /></button>
+          </div>
+        </div>
+
+        <div className="flex-1 min-h-0 flex gap-5 px-6 md:px-8 py-5 overflow-hidden">
+          {TEAM_MEMBERS.map(m => {
+            const mt = thisWeekTasks.filter(t => t.pic === m || (t.tagged_members || []).includes(m));
+            const done = mt.filter(t => t.status === "Done").length;
+            const pct  = mt.length === 0 ? 0 : Math.round((done / mt.length) * 100);
+            const colors = PIC_COLORS[m];
+            const activeTaskId = workingOnTask[m];
+            const activeTask = activeTaskId ? tasks.find(t => t.id === activeTaskId) : null;
+
+            return (
+              <div key={m} className="flex-1 flex flex-col min-w-0 overflow-hidden rounded-2xl border border-[#04154D]/8 dark:border-white/8 bg-white dark:bg-[#0A0A0C]">
+                {/* Member header */}
+                <div className={`px-4 py-3 border-b border-[#04154D]/8 dark:border-white/8 shrink-0 ${colors.bg}`}>
+                  <div className="flex items-center gap-2.5 mb-2">
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-black border ${colors.bg} ${colors.border} ${colors.text}`}>
+                      {m.charAt(0)}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className={`text-sm font-black ${colors.text}`}>{m}</p>
+                      {activeTask ? (
+                        <p className={`text-[9px] font-bold truncate ${colors.text} opacity-70`}>▶ {activeTask.title}</p>
+                      ) : (
+                        <p className="text-[9px] text-[#04154D]/30 dark:text-white/30 italic">Idle</p>
+                      )}
+                    </div>
+                    <span className={`text-[9px] font-black px-2 py-0.5 rounded-full border ${colors.bg} ${colors.border} ${colors.text}`}>
+                      {done}/{mt.length}
+                    </span>
+                  </div>
+                  <div className="w-full h-1.5 bg-[#04154D]/10 dark:bg-white/10 rounded-full overflow-hidden">
+                    <div className={`h-full rounded-full transition-all ${colors.bar}`} style={{ width: `${pct}%` }} />
+                  </div>
+                </div>
+
+                {/* Task list */}
+                <div className="flex-1 overflow-y-auto no-scrollbar p-3 space-y-2">
+                  {mt.length === 0 && (
+                    <p className="text-center text-[9px] text-[#04154D]/20 dark:text-white/20 italic pt-6">No tasks this week</p>
+                  )}
+                  {mt.map(t => {
+                    const isDone = t.status === "Done";
+                    const overdue = isOverdue(t);
+                    const isTagged = t.pic !== m && (t.tagged_members || []).includes(m);
+                    return (
+                      <div key={t.id} onClick={() => setEnrichTask(t)}
+                        className={`flex items-center gap-2 px-3 py-2.5 rounded-xl border cursor-pointer transition-all hover:border-[#2A59FF]/30
+                          ${isDone ? "opacity-40 bg-[#FBFBFD] dark:bg-[#1A1A1D] border-[#04154D]/5 dark:border-white/5" :
+                            overdue ? "bg-red-500/5 border-red-500/20" :
+                            "bg-white dark:bg-[#1A1A1D] border-[#04154D]/8 dark:border-white/8"}`}>
+                        <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${URGENCY_COLORS[t.urgency || "Routine"].dot}`} />
+                        <span className={`flex-1 text-[10px] font-semibold truncate ${isDone ? "line-through text-[#04154D]/40 dark:text-white/40" : "text-[#04154D] dark:text-white"}`}>{t.title}</span>
+                        {isTagged && (
+                          <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded border ${PIC_COLORS[t.pic]?.bg} ${PIC_COLORS[t.pic]?.border} ${PIC_COLORS[t.pic]?.text}`}>{t.pic.charAt(0)}</span>
+                        )}
+                        <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded border shrink-0 ${STATUS_COLORS[t.status]?.bg} ${STATUS_COLORS[t.status]?.border} ${STATUS_COLORS[t.status]?.text}`}>{t.status}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Add task button */}
+                <div className="p-3 border-t border-[#04154D]/5 dark:border-white/5 shrink-0">
+                  <button
+                    onClick={() => {
+                      setNewTask(p => ({ ...p, pic: loggedInUser!, tagged_members: m !== loggedInUser ? [m] : [] }));
+                      setShowQuickAdd(true);
+                    }}
+                    className={`w-full flex items-center justify-center gap-1.5 py-2 rounded-xl text-[10px] font-bold border transition-all hover:scale-[1.02] ${colors.bg} ${colors.border} ${colors.text}`}>
+                    <Plus size={11} /> Add Task for {m}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
         </div>
       </motion.div>
     );
@@ -1086,66 +1286,94 @@ export default function BDApp() {
                       })}
                     </div>
 
-                    {/* Task bars — only Mon–Fri (col indices 1–5) */}
-                    <div className="absolute top-7 left-0 right-0 bottom-0 px-1 pointer-events-none">
-                      {wTasks.map((task, idx) => {
-                        const ts     = parseISO(task.start_date!);
-                        const te     = parseISO(task.end_date || task.start_date!);
-
-                        // Clamp to Mon–Fri within this week
-                        // Get Mon (col 1) and Fri (col 5) of this week
-                        const monday = week[1]; // week is Sun-indexed so week[1]=Mon
-                        const friday = week[5]; // week[5]=Fri
-
-                        // Clamp task span to Mon–Fri
-                        const eStart = ts < monday ? monday : ts > friday ? null : ts;
-                        const eEnd   = te > friday ? friday : te < monday ? null : te;
-                        if (!eStart || !eEnd) return null;
-
-                        // Column index within the 7-col grid (0=Sun,1=Mon,...,6=Sat)
-                        const startDow = getDay(eStart); // 1=Mon...5=Fri
-                        const endDow   = getDay(eEnd);
-                        const span     = endDow - startDow + 1;
-
-                        const colors = userScope === "team" ? PIC_COLORS[task.pic] || PIC_COLORS["Bien"] : URGENCY_COLORS[task.urgency || "Routine"];
-                        const overdue = isOverdue(task);
-
-                        return (
-                          <div key={`${task.id}-${wIdx}`}
-                            draggable
-                            onDragStart={e => onDragStart(e, task.id)}
-                            onDragEnd={() => { setDraggingTaskId(null); setDragOverDate(null); }}
-                            onClick={() => setEnrichTask(task)}
-                            title={task.title}
-                            className={`absolute h-7 rounded-md flex items-center shadow-sm cursor-grab active:cursor-grabbing pointer-events-auto border transition-all hover:scale-[1.01] hover:z-10 group select-none
-                              ${overdue ? "bg-red-500/15 border-red-500/30 text-red-700 dark:text-red-400" : `${colors?.bg || ""} ${colors?.border || ""} ${colors?.text || ""}`}
-                              ${draggingTaskId === task.id ? "opacity-40" : ""}
-                            `}
-                            style={{
-                              left: `calc(${(startDow / 7) * 100}% + 2px)`,
-                              width: `calc(${(span / 7) * 100}% - 4px)`,
-                              top: `${idx * 34}px`
-                            }}>
-
-                            <button onClick={e => handleExtend(task.id, "left", task.start_date!, task.end_date || task.start_date!, e)}
-                              className="absolute -left-3 hidden group-hover:flex items-center justify-center w-5 h-5 bg-white dark:bg-[#1A1A1D] border border-[#04154D]/15 dark:border-white/15 rounded-full shadow-md z-20 hover:scale-125 transition-transform text-[#04154D] dark:text-white cursor-pointer">
-                              <ArrowLeft size={9} />
-                            </button>
-
-                            <div className="flex items-center gap-1.5 px-3 w-full overflow-hidden">
-                              <GripHorizontal size={9} className="opacity-25 shrink-0" />
-                              <span className="text-[9px] font-bold truncate flex-1">{task.title}</span>
-                              {userScope === "team" && <span className="text-[8px] font-black opacity-40 ml-auto shrink-0">{task.pic.charAt(0)}</span>}
+                    {/* Task bars — member mode: spanning bars (Mon–Fri) */}
+                    {userScope === "member" && (
+                      <div className="absolute top-7 left-0 right-0 bottom-0 px-1 pointer-events-none">
+                        {wTasks.map((task, idx) => {
+                          const ts = parseISO(task.start_date!);
+                          const te = parseISO(task.end_date || task.start_date!);
+                          const monday = week[1];
+                          const friday = week[5];
+                          const eStart = ts < monday ? monday : ts > friday ? null : ts;
+                          const eEnd   = te > friday ? friday : te < monday ? null : te;
+                          if (!eStart || !eEnd) return null;
+                          const startDow = getDay(eStart);
+                          const endDow   = getDay(eEnd);
+                          const span     = endDow - startDow + 1;
+                          const colors   = URGENCY_COLORS[task.urgency || "Routine"];
+                          const overdue  = isOverdue(task);
+                          const isDone   = task.status === "Done";
+                          return (
+                            <div key={`${task.id}-${wIdx}`}
+                              draggable
+                              onDragStart={e => onDragStart(e, task.id)}
+                              onDragEnd={() => { setDraggingTaskId(null); setDragOverDate(null); }}
+                              onClick={() => setEnrichTask(task)}
+                              title={task.title}
+                              className={`absolute h-7 rounded-md flex items-center shadow-sm cursor-grab active:cursor-grabbing pointer-events-auto border transition-all hover:scale-[1.01] hover:z-10 group select-none
+                                ${overdue ? "bg-red-500/15 border-red-500/30 text-red-700 dark:text-red-400" : `${colors?.bg || ""} ${colors?.border || ""} ${colors?.text || ""}`}
+                                ${draggingTaskId === task.id ? "opacity-40" : ""}
+                                ${isDone ? "opacity-25 cursor-default" : ""}
+                              `}
+                              style={{
+                                left: `calc(${(startDow / 7) * 100}% + 2px)`,
+                                width: `calc(${(span / 7) * 100}% - 4px)`,
+                                top: `${idx * 34}px`
+                              }}>
+                              <button onClick={e => handleExtend(task.id, "left", task.start_date!, task.end_date || task.start_date!, e)}
+                                className="absolute -left-3 hidden group-hover:flex items-center justify-center w-5 h-5 bg-white dark:bg-[#1A1A1D] border border-[#04154D]/15 dark:border-white/15 rounded-full shadow-md z-20 hover:scale-125 transition-transform text-[#04154D] dark:text-white cursor-pointer">
+                                <ArrowLeft size={9} />
+                              </button>
+                              <div className="flex items-center gap-1.5 px-3 w-full overflow-hidden">
+                                <GripHorizontal size={9} className="opacity-25 shrink-0" />
+                                <span className="text-[9px] font-bold truncate flex-1">{task.title}</span>
+                              </div>
+                              <button onClick={e => handleExtend(task.id, "right", task.start_date!, task.end_date || task.start_date!, e)}
+                                className="absolute -right-3 hidden group-hover:flex items-center justify-center w-5 h-5 bg-white dark:bg-[#1A1A1D] border border-[#04154D]/15 dark:border-white/15 rounded-full shadow-md z-20 hover:scale-125 transition-transform text-[#04154D] dark:text-white cursor-pointer">
+                                <ArrowRight size={9} />
+                              </button>
                             </div>
+                          );
+                        })}
+                      </div>
+                    )}
 
-                            <button onClick={e => handleExtend(task.id, "right", task.start_date!, task.end_date || task.start_date!, e)}
-                              className="absolute -right-3 hidden group-hover:flex items-center justify-center w-5 h-5 bg-white dark:bg-[#1A1A1D] border border-[#04154D]/15 dark:border-white/15 rounded-full shadow-md z-20 hover:scale-125 transition-transform text-[#04154D] dark:text-white cursor-pointer">
-                              <ArrowRight size={9} />
-                            </button>
-                          </div>
-                        );
-                      })}
-                    </div>
+                    {/* Task chips — team mode: compact per-day chips grouped by member */}
+                    {userScope === "team" && (
+                      <div className="absolute top-7 left-0 right-0 bottom-0 grid grid-cols-7">
+                        {week.map((day, dayIdx) => {
+                          if (isWeekend(day)) return <div key={dayIdx} />;
+                          const dayTasks = wTasks.filter(t => {
+                            const ts = parseISO(t.start_date!);
+                            const te = parseISO(t.end_date || t.start_date!);
+                            return ts <= day && te >= day;
+                          });
+                          return (
+                            <div key={dayIdx} className="px-0.5 pt-1 flex flex-col gap-0.5 overflow-hidden">
+                              {TEAM_MEMBERS.map(m => {
+                                const mTasks = dayTasks.filter(t => t.pic === m);
+                                if (mTasks.length === 0) return null;
+                                const colors = PIC_COLORS[m];
+                                return mTasks.map(t => {
+                                  const isDone = t.status === "Done";
+                                  return (
+                                    <div key={t.id}
+                                      onClick={() => setEnrichTask(t)}
+                                      title={t.title}
+                                      className={`h-5 rounded border px-1 flex items-center cursor-pointer hover:opacity-80 transition-opacity
+                                        ${colors.bg} ${colors.border}
+                                        ${isDone ? "opacity-20" : ""}
+                                      `}>
+                                      <span className={`text-[8px] font-bold truncate ${colors.text}`}>{t.title}</span>
+                                    </div>
+                                  );
+                                });
+                              })}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -1450,6 +1678,20 @@ export default function BDApp() {
                           </div>
                         );
                       })()}
+
+                      {/* Drag overlay — captures drop events when blocks are on top */}
+                      {(draggingTBTaskId || resizingTB) && (
+                        <div className="absolute inset-0 z-50 flex flex-col">
+                          {slots.map(i => (
+                            <div key={`ov-${i}`}
+                              style={{ height: CELL_HEIGHT }}
+                              onDragOver={e => { e.preventDefault(); setTbDragOverSlot({ member, slot: i }); }}
+                              onDrop={e => handleTimelineDrop(e, member, i)}
+                              onDragLeave={() => setTbDragOverSlot(null)}
+                            />
+                          ))}
+                        </div>
+                      )}
                     </div>
                   </div>
                 );
@@ -1623,6 +1865,27 @@ export default function BDApp() {
             </div>
           </div>
 
+          <div>
+            <label className="text-[10px] font-bold uppercase tracking-widest text-[#04154D]/40 dark:text-white/40 block mb-2">Tag Members</label>
+            <div className="flex gap-2">
+              {TEAM_MEMBERS.filter(m => m !== (newTask.pic || loggedInUser)).map(m => {
+                const tagged = (newTask.tagged_members || []).includes(m);
+                const c = PIC_COLORS[m];
+                return (
+                  <button type="button" key={m}
+                    onClick={() => {
+                      const curr = newTask.tagged_members || [];
+                      setNewTask({ ...newTask, tagged_members: tagged ? curr.filter(x => x !== m) : [...curr, m] });
+                    }}
+                    className={`flex-1 py-2 rounded-xl text-[10px] font-bold transition-all border
+                      ${tagged ? `${c.bg} ${c.border} ${c.text}` : "border-[#04154D]/10 dark:border-white/10 text-[#04154D]/50 dark:text-white/50 hover:bg-[#04154D]/5 dark:hover:bg-white/5"}`}>
+                    {tagged ? `✓ ${m}` : m}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           <button type="button"
             onClick={() => setNewTask({ ...newTask, is_colleague_request: !newTask.is_colleague_request })}
             className={`w-full flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-bold transition-all border ${newTask.is_colleague_request
@@ -1678,6 +1941,7 @@ export default function BDApp() {
   // ═══════════════════════════════════════════════════════════════════════════
   //  ENRICH PANEL
   // ═══════════════════════════════════════════════════════════════════════════
+
   function renderEnrichModal() {
     if (!enrichTask) return null;
     return (
@@ -1699,10 +1963,16 @@ export default function BDApp() {
                 <p className="text-xs font-bold text-[#04154D]/60 dark:text-white/60">{enrichTask.pic}</p>
               </div>
             </div>
-            <button onClick={() => setEnrichTask(null)}
-              className="p-2 bg-white dark:bg-[#121214] rounded-full hover:scale-110 transition-transform border border-[#04154D]/8 dark:border-white/8 text-[#04154D] dark:text-white">
-              <X size={16} />
-            </button>
+            <div className="flex items-center gap-2">
+              <button onClick={() => { if (confirm("Delete this task?")) deleteTask(enrichTask.id); }}
+                className="p-2 bg-red-500/10 rounded-full hover:scale-110 transition-transform border border-red-500/20 text-red-500">
+                <X size={14} />
+              </button>
+              <button onClick={() => setEnrichTask(null)}
+                className="p-2 bg-white dark:bg-[#121214] rounded-full hover:scale-110 transition-transform border border-[#04154D]/8 dark:border-white/8 text-[#04154D] dark:text-white">
+                <X size={16} />
+              </button>
+            </div>
           </div>
 
           <div className="flex-1 overflow-y-auto no-scrollbar p-8 space-y-7 min-h-0">
@@ -1764,6 +2034,27 @@ export default function BDApp() {
                 <input type="date" value={enrichTask.end_date || ""}
                   onChange={e => updateTask(enrichTask.id, { end_date: e.target.value })}
                   className="w-full bg-[#FBFBFD] dark:bg-[#1A1A1D] text-[#04154D] dark:text-white rounded-xl px-4 py-3 text-sm font-bold border border-[#04154D]/10 dark:border-white/10 outline-none" />
+              </div>
+            </div>
+
+            <div>
+              <label className="text-[10px] font-bold uppercase tracking-widest text-[#04154D]/40 dark:text-white/40 block mb-2">Tagged Members</label>
+              <div className="flex gap-2">
+                {TEAM_MEMBERS.filter(m => m !== enrichTask.pic).map(m => {
+                  const tagged = (enrichTask.tagged_members || []).includes(m);
+                  const c = PIC_COLORS[m];
+                  return (
+                    <button type="button" key={m}
+                      onClick={() => {
+                        const curr = enrichTask.tagged_members || [];
+                        updateTask(enrichTask.id, { tagged_members: tagged ? curr.filter(x => x !== m) : [...curr, m] });
+                      }}
+                      className={`flex-1 py-2 rounded-xl text-[10px] font-bold transition-all border
+                        ${tagged ? `${c.bg} ${c.border} ${c.text}` : "border-[#04154D]/10 dark:border-white/10 text-[#04154D]/50 dark:text-white/50 hover:bg-[#04154D]/5 dark:hover:bg-white/5"}`}>
+                      {tagged ? `✓ ${m}` : m}
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
@@ -1977,53 +2268,62 @@ export default function BDApp() {
   // ═══════════════════════════════════════════════════════════════════════════
   return (
     <div className={`h-[100dvh] w-full overflow-hidden transition-colors duration-300 ${isDarkMode ? "dark" : ""}`}>
-      <div className="flex flex-col h-full w-full bg-[#FBFBFD] dark:bg-[#050505] text-[#04154D] dark:text-[#FBFBFD]">
+      <div className="flex h-full w-full bg-[#FBFBFD] dark:bg-[#050505] text-[#04154D] dark:text-[#FBFBFD]">
 
-        <header className="shrink-0 h-14 flex items-center justify-between px-4 md:px-6 bg-[#FBFBFD] dark:bg-[#050505] border-b border-[#04154D]/5 dark:border-white/5 z-20">
-          <div className="flex items-center gap-4 md:gap-5">
-            <span className="text-base font-black tracking-tight text-[#04154D] dark:text-white">BD TEAM</span>
-            <div className="w-px h-5 bg-[#04154D]/10 dark:bg-white/10" />
-            <nav className="flex items-center gap-1 bg-white dark:bg-[#121214] border border-[#04154D]/8 dark:border-white/8 rounded-xl p-1">
-              <button onClick={() => setActiveTab("dashboard")}
-                className={`flex items-center gap-1.5 px-3 md:px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${activeTab === "dashboard" ? "bg-[#04154D] dark:bg-white text-white dark:text-[#0A0A0C] shadow-sm" : "text-[#04154D]/50 dark:text-white/50 hover:text-[#04154D] dark:hover:text-white"}`}>
-                <LayoutDashboard size={13} /> <span className="hidden sm:inline">Dashboard</span>
-              </button>
-              <button onClick={() => setActiveTab("calendar")}
-                className={`flex items-center gap-1.5 px-3 md:px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${activeTab === "calendar" ? "bg-[#04154D] dark:bg-white text-white dark:text-[#0A0A0C] shadow-sm" : "text-[#04154D]/50 dark:text-white/50 hover:text-[#04154D] dark:hover:text-white"}`}>
-                <CalendarIcon size={13} /> <span className="hidden sm:inline">Timeline</span>
-              </button>
-              <button onClick={() => setActiveTab("timeblock")}
-                className={`flex items-center gap-1.5 px-3 md:px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${activeTab === "timeblock" ? "bg-[#04154D] dark:bg-white text-white dark:text-[#0A0A0C] shadow-sm" : "text-[#04154D]/50 dark:text-white/50 hover:text-[#04154D] dark:hover:text-white"}`}>
-                <Timer size={13} /> <span className="hidden sm:inline">Time Blocks</span>
-              </button>
-            </nav>
+        <aside className="w-56 lg:w-64 shrink-0 flex flex-col bg-[#FBFBFD] dark:bg-[#050505] border-r border-[#04154D]/5 dark:border-white/5 z-20">
+          <div className="h-16 flex items-center px-6 border-b border-[#04154D]/5 dark:border-white/5 shrink-0">
+            <span className="text-lg font-black tracking-tight text-[#04154D] dark:text-white">BD TEAM</span>
           </div>
 
-          <div className="flex items-center gap-2">
-            {/* Steam-style "now playing" in nav */}
+          <div className="p-4 flex flex-col gap-1 flex-1">
+            <p className="text-[10px] font-black uppercase tracking-widest text-[#04154D]/30 dark:text-white/30 mb-2 px-2 mt-2">Views</p>
+            <button onClick={() => setActiveTab("dashboard")}
+              className={`flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold transition-all ${activeTab === "dashboard" ? "bg-[#04154D] dark:bg-white text-white dark:text-[#0A0A0C] shadow-md" : "text-[#04154D]/60 dark:text-white/60 hover:bg-[#04154D]/5 dark:hover:bg-white/5"}`}>
+              <LayoutDashboard size={16} /> Dashboard
+            </button>
+            <button onClick={() => setActiveTab("workload")}
+              className={`flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold transition-all ${activeTab === "workload" ? "bg-[#04154D] dark:bg-white text-white dark:text-[#0A0A0C] shadow-md" : "text-[#04154D]/60 dark:text-white/60 hover:bg-[#04154D]/5 dark:hover:bg-white/5"}`}>
+              <Users size={16} /> Team Workload
+            </button>
+            <button onClick={() => setActiveTab("calendar")}
+              className={`flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold transition-all ${activeTab === "calendar" ? "bg-[#04154D] dark:bg-white text-white dark:text-[#0A0A0C] shadow-md" : "text-[#04154D]/60 dark:text-white/60 hover:bg-[#04154D]/5 dark:hover:bg-white/5"}`}>
+              <CalendarIcon size={16} /> Timeline
+            </button>
+            <button onClick={() => setActiveTab("timeblock")}
+              className={`flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-bold transition-all ${activeTab === "timeblock" ? "bg-[#04154D] dark:bg-white text-white dark:text-[#0A0A0C] shadow-md" : "text-[#04154D]/60 dark:text-white/60 hover:bg-[#04154D]/5 dark:hover:bg-white/5"}`}>
+              <Timer size={16} /> Daily Planner
+            </button>
+
             {loggedInUser && workingOnTask[loggedInUser] && (() => {
               const t = tasks.find(x => x.id === workingOnTask[loggedInUser!]);
               return t ? (
-                <div className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-[#2A59FF]/8 border border-[#2A59FF]/20 rounded-xl">
-                  <div className="w-1.5 h-1.5 rounded-full bg-[#2A59FF] animate-pulse" />
-                  <span className="text-[10px] font-bold text-[#2A59FF] max-w-[180px] truncate">{t.title}</span>
+                <div className="mt-6 flex flex-col gap-2 p-3 bg-[#2A59FF]/5 border border-[#2A59FF]/20 rounded-2xl">
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-1.5 h-1.5 rounded-full bg-[#2A59FF] animate-pulse" />
+                    <span className="text-[10px] font-black uppercase tracking-widest text-[#2A59FF]">Working On</span>
+                  </div>
+                  <span className="text-xs font-bold text-[#04154D] dark:text-white leading-tight line-clamp-2">{t.title}</span>
                 </div>
               ) : null;
             })()}
-            <button onClick={() => setIsDarkMode(p => !p)}
-              className="p-2 rounded-xl text-[#04154D]/40 dark:text-white/40 hover:bg-[#04154D]/5 dark:hover:bg-white/5 transition-colors">
-              {isDarkMode ? <Sun size={16} /> : <Moon size={16} />}
-            </button>
-            <div className="w-px h-5 bg-[#04154D]/10 dark:bg-white/10 mx-1" />
-            <div className="flex items-center gap-2">
-              <div className={`w-7 h-7 rounded-full flex items-center justify-center text-[11px] font-black border ${PIC_COLORS[loggedInUser!]?.bg} ${PIC_COLORS[loggedInUser!]?.border} ${PIC_COLORS[loggedInUser!]?.text}`}>
+          </div>
+
+          <div className="p-4 border-t border-[#04154D]/5 dark:border-white/5 shrink-0 flex items-center justify-between">
+            <div className="flex items-center gap-2.5">
+              <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-black border ${PIC_COLORS[loggedInUser!]?.bg || ""} ${PIC_COLORS[loggedInUser!]?.border || ""} ${PIC_COLORS[loggedInUser!]?.text || ""}`}>
                 {loggedInUser!.charAt(0)}
               </div>
-              <span className="hidden sm:inline text-xs font-bold text-[#04154D] dark:text-white">{loggedInUser}</span>
-              <button onClick={handleLogout} className="p-1.5 text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"><LogOut size={14} /></button>
+              <span className="text-sm font-bold text-[#04154D] dark:text-white">{loggedInUser}</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <button onClick={() => setIsDarkMode(p => !p)}
+                className="p-2 rounded-xl text-[#04154D]/40 dark:text-white/40 hover:bg-[#04154D]/5 dark:hover:bg-white/5 transition-colors">
+                {isDarkMode ? <Sun size={16} /> : <Moon size={16} />}
+              </button>
+              <button onClick={handleLogout} className="p-2 text-red-400 hover:bg-red-500/10 rounded-xl transition-colors"><LogOut size={16} /></button>
             </div>
           </div>
-        </header>
+        </aside>
 
         <main className="flex-1 relative min-h-0 overflow-hidden
           bg-white dark:bg-[#0A0A0C]
@@ -2032,6 +2332,7 @@ export default function BDApp() {
           shadow-[inset_0_0_24px_rgba(4,21,77,0.03)]">
           <AnimatePresence mode="wait">
             {activeTab === "dashboard" && renderDashboard()}
+            {activeTab === "workload" && renderWorkload()}
             {activeTab === "calendar" && renderCalendar()}
             {activeTab === "timeblock" && renderTimeBlock()}
           </AnimatePresence>
