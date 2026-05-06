@@ -329,7 +329,8 @@ export default function BDApp() {
       end_date: newTask.end_date || null,
       tagged_members: newTask.tagged_members || [],
     }]).select();
-    if (!error && data) {
+    if (error) { console.error("addTask error:", error); return; }
+    if (data) {
       setTasks(p => p.find(t => t.id === data[0].id) ? p : [...p, data[0]]);
       setNewTask({ title: "", urgency: "Routine", is_colleague_request: false, start_date: "", end_date: "", notes: "", links: "", pic: loggedInUser, tagged_members: [] });
       setShowQuickAdd(false);
@@ -347,7 +348,8 @@ export default function BDApp() {
     if (updates.end_date === "") updates.end_date = null;
     setTasks(p => p.map(t => t.id === id ? { ...t, ...updates } : t));
     setEnrichTask(p => p?.id === id ? { ...p!, ...updates } : p);
-    await supabase.from("tasks").update(updates).eq("id", id);
+    const { error } = await supabase.from("tasks").update(updates).eq("id", id);
+    if (error) console.error("updateTask error:", error);
   };
 
   const handleDefer = async () => {
